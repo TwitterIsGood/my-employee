@@ -3,11 +3,17 @@
 
 非 Agent、纯函数、不含模型调用。规则见 standards/projection.md。
 
+两道门：
+  1. type 必须在白名单里（黑名单/未知类型的处理见下）
+  2. 白名单类型还必须显式标 `"confirmed": true` —— 类型对不代表事实已成立，
+     一条 type=change 也可以是"我们准备改"。缺省不等于已确认。
+
 用法:
     python3 project.py <events.jsonl> [--out projection.md]
 
 任何违反规则的记录都会让脚本**报错退出**（不静默丢弃）——
 静默丢弃会让后台以为自己上报了，而前台其实什么都没收到。
+只有两种"不出"是正常的：黑名单类型、和显式标了 confirmed=false 的在途事项。
 """
 import json
 import sys
@@ -22,6 +28,10 @@ REQUIRED = {
     "decision_needed": ("options",),
 }
 FORBIDDEN = {"retry", "hypothesis", "debate", "progress", "intent", "plan", "draft"}
+
+# 类型对不代表事实对。一条记录可以**类型**是 change、却还只是"我们准备改"。
+# 所以白名单类型必须再显式声明一次：这件事到底发生了没有。
+CONFIRMED = "confirmed"
 
 HEADINGS = OrderedDict([
     ("blocker", "卡点"),
@@ -60,7 +70,16 @@ def validate(ev, lineno):
     if t not in ALLOWED:
         die(f"第 {lineno} 条 type={t!r} 既不在白名单也不在黑名单——无法判定，请显式归类")
 
-    # 白名单记录：必须带证据
+    # 类型对不代表事实对：白名单类型也必须显式声明"这件事发生了没有"。
+    # 标了 false → 还在飞，不出（不算错，后台本来就该记在途的事）。
+    # 没标 → 判不出来，报错退出。**缺省不等于已确认**，这是这条的意义所在。
+    if CONFIRMED not in ev:
+        die(f"第 {lineno} 条 type={t} 没有 {CONFIRMED} 标记——"
+            f"类型是白名单不等于事实已成立，请显式标 true/false")
+    if ev[CONFIRMED] is not True:
+        return False
+
+    # 已确认的事实：必须带证据
     if not ev.get("evidence"):
         die(f"第 {lineno} 条 type={t} 是白名单类型但没有 evidence——"
             f"没有可复现证据的'事实'只是另一种猜测")
@@ -110,14 +129,16 @@ def main():
         dst = sys.argv[sys.argv.index("--out") + 1]
 
     events = load(src)
-    kept, dropped = [], 0
+    kept, black, unconf = [], 0, 0
     for lineno, ev in enumerate(events, 1):
         if validate(ev, lineno):
             if not ev.get("summary"):
                 die(f"第 {lineno} 条缺 summary——前台需要一句人话，不是字段堆")
             kept.append(ev)
+        elif ev.get("type") in FORBIDDEN:
+            black += 1
         else:
-            dropped += 1
+            unconf += 1
 
     stage = next((e.get("stage") for e in reversed(events) if e.get("stage")), None)
     last = next((e["summary"] for e in reversed(kept) if e["type"] == "change"), None)
@@ -125,7 +146,8 @@ def main():
     with open(dst, "w", encoding="utf-8") as fh:
         fh.write(render(kept, stage, last))
 
-    print(f"{len(events)} 条事件 -> 出口 {len(kept)} 条，拦下 {dropped} 条 -> {dst}")
+    print(f"{len(events)} 条事件 -> 出口 {len(kept)} 条，"
+          f"拦下 {black + unconf} 条（黑名单 {black} / 未定论 {unconf}）-> {dst}")
 
 
 main()
