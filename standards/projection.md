@@ -54,5 +54,21 @@ projection.md（前台唯一能看到的东西）
 `project.py` 对违反这三条的记录**直接报错退出**，不静默丢弃——静默丢弃会让后台以为自己上报了。
 只有两种"不出"是正常的：黑名单类型、和显式标了 `confirmed=false` 的在途事项。
 
-校验逻辑的可执行版本在 [`back/test_projection.py`](../back/test_projection.py)，
+校验逻辑的可执行版本在 [`internal/projection/projection_test.go`](../internal/projection/projection_test.go)，
 含构造的验收用例：「我们准备…」（类型合法但未确认）必须被拦下。
+
+## 闸门怎么接进来
+
+规则写在文档里会腐，所以真正生效的是 harness 侧的一个进程，
+Agent 每轮的上下文由它产生、且**只由它产生**：
+
+```
+后台事件日志（raw，前台永远拿不到路径）
+        │
+        ▼   cmd/gate —— UserPromptSubmit hook，非 Agent
+        │     投影器报错时 fail-closed 到「状态不可读」，不是放行
+        ▼
+projection.md（前台唯一看得到的东西）+ 注入当轮上下文
+```
+
+Agent 跑起来时通过 `--settings` 带上这个 hook，见 [`resilience.md`](resilience.md) 第 5 条。

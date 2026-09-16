@@ -66,12 +66,14 @@
 
 **要求**：
 - 出口是否生效，必须用 **egress 观测**验证，不能只看配置回显。
-  工具见 [`tools/egress_listener.py`](../tools/egress_listener.py)：把出口指到本机监听器，
+  工具见 [`cmd/egress-listener`](../cmd/egress-listener)：把出口指到本机监听器，
   发一条消息，日志里**出现 POST 才算这个出口真的在生效**。
 - 覆盖机制必须选**优先级足够高**的那一个。实测 env 的生效顺序（低 → 高）：
   `继承的进程环境 < user settings < --settings 参数 < 托管策略`。
   所以 `custom_env`（=`< user settings`）必输；要覆盖就得走
   `custom_args: ["--settings", "<file>"]`。
-- 本机落地方式：`local/agent-egress.json`（gitignored，含凭据）
+- 本机落地方式：`local/agents/daguanjia.settings.json`（gitignored，含凭据）
   \+ `multica agent update <id> --custom-args '["--settings","<abs path>"]'`。
   同时把失效的 `custom_env` **清空**——留着它只会让人以为有备胎。
+- 顺带：这个 settings 文件同时是**闸门**的载体（`hooks.UserPromptSubmit` 指向
+  `local/bin/gate`）。一个 Agent 跑起来时带着什么约束，和它走哪个出口，是同一份配置。

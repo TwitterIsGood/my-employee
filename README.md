@@ -33,7 +33,7 @@
 
 两条硬约束：
 
-1. **前台读到的只能是白名单投影，不是原始后台记录。** 过滤标准是**确定性**，不是好坏——不报未定论的过程（重试次数、失败假设、后台争论），必须报已确认的事实（失败、变更、影响面、观测数字）。
+1. **前台读到的只能是白名单投影，不是原始后台记录。** 过滤标准是**确定性**，不是好坏——不报未定论的过程（重试次数、失败假设、后台争论），必须报已确认的事实（失败、变更、影响面、观测数字）。**已落地**：`cmd/gate` 是前台每轮上下文的唯一来源，原始事件日志它连路径都拿不到。
 2. **闸门住在 harness，不住在 Agent 里。** harness 是唯一同时接触「模型说了什么」和「环境真的发生了什么」的一层。靠 prompt 自觉守不住——见下面验证 A 的缺陷 1。
 
 ## 取和舍
@@ -48,11 +48,20 @@
 
 ## 目录
 
+Go，除 `front/` 那个假 IM 适配器（一次性的、换真飞书时整块丢掉）。
+
 ```
+cmd/gate/                  前台上下文闸门 —— UserPromptSubmit hook，非 Agent
+cmd/projector/             投影器 CLI
+cmd/egress-listener/       出口观测器（验证「备胎真的生效了」）
+internal/projection/       投影与校验（纯函数，回归闸 = projection_test.go）
 standards/delivery.md      六要两不要（单一事实源，双渲染成散文 + 闸门谓词）
+standards/projection.md    投影规则（前台能看到的 vs 看不到的）
+standards/resilience.md    上游韧性（从一个真实故障里总结）
 front/                     前台：大总管指令、假 IM 适配器、延迟探针
-back/                      后台：流水线节点 Agent、对抗审查、回归闸
+back/fixtures/             投影的回归样本（含真实泄漏原文）
 runs/                      验证记录与证据
+local/                     gitignored：凭据、Agent settings、运行时状态
 ```
 
 ## 已完成的验证
@@ -64,6 +73,12 @@ runs/                      验证记录与证据
 ## 复现
 
 ```bash
+make build        # 产出 local/bin/{gate,projector,egress-listener}
+make test         # 投影层回归闸，10 项断言
+
+# 只看投影：后台事件 -> 前台唯一可见的状态文档
+./local/bin/projector back/fixtures/events-active-users.jsonl --out /tmp/proj.md
+
 # 假 IM 适配器（用 multica chat API 当传输层）
 cd front
 ./im.sh new 会话名                  # 新建会话，打印 session id
@@ -75,3 +90,13 @@ python3 timing_probe.py <sid> "问题"
 ```
 
 依赖：本机跑着 multica（`multica config` 里的 `server_url`），凭据读自 `~/.multica/config.json`，不落在仓库里。
+
+Agent 侧接闸门的做法：
+
+```bash
+multica agent update <id> --custom-args '["--settings","<abs>/local/agents/<name>.settings.json"]'
+```
+
+那个 settings 文件里同时挂着出口（`env.ANTHROPIC_BASE_URL` 等）和闸门（`hooks.UserPromptSubmit`）。
+两个都必须走它，原因见 [`standards/resilience.md`](standards/resilience.md) 第 5 条——
+`custom_env` 是静默失效的，配了看着正常，请求根本不走。
