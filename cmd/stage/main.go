@@ -30,6 +30,8 @@ const usage = `stage —— 把流水线的一个阶段派给一次唤醒（非 
   --worker-cmd <c>   唤醒命令，prompt 从 stdin 进（默认见下）
   --settings <file>  传给 claude 的 --settings（挂出口与 hooks）
   --work <dir>       唤醒命令的工作目录（开发类的阶段要给代码仓库，默认同 --dir）
+  --brief <file>     需求方的答复（JSON）。后台唯一的"确认"来源——
+                     没有它，要需求方拍板的字段只许写 assumed
 
 默认唤醒命令：
   claude -p --settings <settings> --dangerously-skip-permissions
@@ -37,7 +39,7 @@ const usage = `stage —— 把流水线的一个阶段派给一次唤醒（非 
   非 Agent 阶段（07 回归）用 --worker-cmd 换成"跑回归并写出报告"的脚本——
   判定逻辑完全一样，换的只是命令。
 
-退出码：0 通过 / 1 被打回或预算用尽 / 2 用法或读取错误。
+退出码：0 通过 / 1 被打回或预算用尽 / 2 用法或读取错误 / 3 停在原地等人答复。
 `
 
 func main() {
@@ -48,7 +50,10 @@ func main() {
 }
 
 func exitCode(err error) int {
-	if errors.Is(err, dispatch.ErrRejectedUpstream) || errors.Is(err, dispatch.ErrBudgetExhausted) {
+	switch {
+	case errors.Is(err, dispatch.ErrAwaitingInput):
+		return 3 // 在等人，不是失败——调用方等着拿答复再来叫醒同一段
+	case errors.Is(err, dispatch.ErrRejectedUpstream), errors.Is(err, dispatch.ErrBudgetExhausted):
 		return 1
 	}
 	return 2
@@ -71,6 +76,7 @@ func run(args []string) error {
 		workerCmd = fs.String("worker-cmd", "", "唤醒命令")
 		settings  = fs.String("settings", "", "claude 的 --settings 文件")
 		work      = fs.String("work", "", "唤醒命令的工作目录")
+		brief     = fs.String("brief", "", "需求方的答复")
 	)
 	flags, pos := splitFlags(args[1:])
 	if err := fs.Parse(flags); err != nil {
@@ -122,6 +128,7 @@ func run(args []string) error {
 		Events:   *eventsLog,
 		Budget:   *budget,
 		Item:     *item,
+		Brief:    *brief,
 		Log:      os.Stdout,
 		Worker:   dispatch.CmdWorker{Cmd: cmd, Dir: workDir, Log: nil},
 	}.Run(context.Background(), pos[0])

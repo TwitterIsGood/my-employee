@@ -102,6 +102,10 @@ make test         # 投影层回归闸 + 阶段契约 + 流水线判定 + 派活
                   --dangerously-skip-permissions"
 # 非 Agent 阶段（07 回归）换 --worker-cmd 就行，判定逻辑完全一样
 
+# 口径定不下来时它会停住等人（退出码 3），取舍经投影摆到需求方面前；
+# 答复回来再叫醒同一段——后台唯一的"确认"来源就是这份答复
+./local/bin/stage run 01 --dir local/tmp/art --brief local/tmp/brief.json …
+
 # 假 IM 适配器（用 multica chat API 当传输层）
 cd front
 ./im.sh new 会话名                  # 新建会话，打印 session id

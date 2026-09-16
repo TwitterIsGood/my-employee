@@ -38,6 +38,10 @@ type Stage struct {
 	// 入口条件来自不同上游时，各自该打回的地方不一样：06 的变更卡缺字段打回 03
 	// （05 复审），而审查记录的问题打回 05。这里按交付物名覆盖 RejectTo。
 	RejectUpstream map[string]string `json:"reject_upstream,omitempty"`
+	// PauseOn 指向交付物里的一个字段：它非空（且形如决策项）时，本阶段是在**等人**，
+	// 不是在失败。例：01 的口径定不下来，就该把取舍摆给需求方然后停住——
+	// 停住是一次正常的中断，不是撞南墙；重跑多少次都问不出需求方的答案。
+	PauseOn string `json:"pause_on,omitempty"`
 }
 
 // Artifact 是一个交付物：字段名 -> 值。

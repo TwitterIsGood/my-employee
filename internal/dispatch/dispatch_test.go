@@ -71,6 +71,7 @@ func TestCannotSelfConfirm(t *testing.T) {
 		confirmed[k] = v
 	}
 	confirmed["确认状态"] = "confirmed"
+	confirmed["确认来源"] = "im 会话 3f2a… 消息 #12"
 
 	calls, w := writer(dir, "需求定义卡", assumed, assumed, confirmed)
 	err := Runner{
@@ -186,7 +187,8 @@ func TestBadArtifactIsRetriedNotIgnored(t *testing.T) {
 		}
 		return os.WriteFile(filepath.Join(dir, "需求定义卡.json"), []byte(`{
 			"目标":"做活跃度看板","范围内":["日活"],"范围外":["不做留存"],
-			"验收标准":"p99 < 500ms","确认状态":"confirmed"}`), 0o644)
+			"验收标准":"p99 < 500ms","确认状态":"confirmed",
+			"确认来源":"im 会话 3f2a… 消息 #12"}`), 0o644)
 	})
 
 	err := Runner{
@@ -246,6 +248,7 @@ func TestStageMarkerIsDeterministic(t *testing.T) {
 	_, w := writer(dir, "需求定义卡", map[string]any{
 		"目标": "做看板", "范围内": []string{"日活"}, "范围外": []string{"不做留存"},
 		"验收标准": "p99 < 500ms", "确认状态": "confirmed",
+		"确认来源": "im 会话 3f2a… 消息 #12",
 	})
 
 	err := Runner{
@@ -268,16 +271,167 @@ func TestStageMarkerIsDeterministic(t *testing.T) {
 	}
 }
 
+// 口径定不下来时，本阶段该**停住等人**，不是失败、也不是重跑。
+// 重跑多少次都问不出需求方本人的答案。
+func TestPausesWhenWaitingForStakeholder(t *testing.T) {
+	dir := t.TempDir()
+	eventsLog := filepath.Join(dir, "events.jsonl")
+
+	calls := 0
+	w := WorkerFunc(func(_ context.Context, _ string) error {
+		calls++
+		return os.WriteFile(filepath.Join(dir, "需求定义卡.json"), []byte(`{
+			"目标":"做活跃度看板","范围内":["日活"],"范围外":["不做留存"],
+			"验收标准":"p99 < 500ms","确认状态":"assumed",
+			"待决策":[{
+				"问题":"活跃的口径",
+				"选项":[
+					{"选项":"只统计登录时间","代价":"users.last_login_at 已有索引，今天就能出"},
+					{"选项":"登录 + 业务操作","代价":"audit_log 4.2 亿行，加索引需一次停机窗口"}
+				]
+			}]}`), 0o644)
+	})
+
+	err := Runner{
+		Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+		Events: eventsLog, Budget: 3, Item: "活跃度看板", Worker: w,
+	}.Run(context.Background(), "01")
+
+	if !errors.Is(err, ErrAwaitingInput) {
+		t.Fatalf("该停在原地等人，实际 %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("在等人就不该重跑，实际唤醒了 %d 次", calls)
+	}
+
+	// 取舍要摆到台面上：前台据此问需求方。
+	evs := readEvents(t, eventsLog)
+	var asks []map[string]any
+	for _, e := range evs {
+		if e["type"] == "decision_needed" {
+			asks = append(asks, e)
+		}
+	}
+	if len(asks) != 1 {
+		t.Fatalf("应恰好摆出 1 项待决策，实际 %d 项", len(asks))
+	}
+	opts, _ := asks[0]["options"].([]any)
+	if len(opts) != 2 {
+		t.Fatalf("选项该有 2 个，实际 %d 个：%v", len(opts), opts)
+	}
+	for _, o := range opts {
+		if !strings.Contains(str(o), "：") {
+			t.Errorf("每个选项都要带代价，实际 %q", o)
+		}
+	}
+	// 每条都要有证据，否则投影层会直接判整次投影失败。
+	if str(asks[0]["evidence"]) == "" {
+		t.Error("decision_needed 必须带 evidence")
+	}
+}
+
+// "我在等人"不能成为绕开出口条件的捷径：选项不成形就不算暂停。
+func TestMalformedPauseIsNotAPause(t *testing.T) {
+	cases := []struct {
+		name  string
+		pause any
+	}{
+		{"字段缺失", nil},
+		{"空数组", []any{}},
+		{"只有一个选项", []any{map[string]any{
+			"问题": "口径", "选项": []any{map[string]any{"选项": "只算登录", "代价": "快"}},
+		}}},
+		{"选项没有代价", []any{map[string]any{
+			"问题": "口径", "选项": []any{
+				map[string]any{"选项": "只算登录", "代价": ""},
+				map[string]any{"选项": "带业务操作", "代价": "要停机"},
+			},
+		}}},
+		{"没有问题", []any{map[string]any{
+			"问题": "", "选项": []any{
+				map[string]any{"选项": "A", "代价": "x"},
+				map[string]any{"选项": "B", "代价": "y"},
+			},
+		}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			card := map[string]any{
+				"目标": "做看板", "范围内": []string{"日活"}, "范围外": []string{"不做留存"},
+				"验收标准": "p99 < 500ms", "确认状态": "assumed",
+			}
+			if tc.pause != nil {
+				card["待决策"] = tc.pause
+			}
+			calls, w := writer(dir, "需求定义卡", card)
+
+			err := Runner{
+				Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+				Budget: 2, Worker: w,
+			}.Run(context.Background(), "01")
+
+			if !errors.Is(err, ErrBudgetExhausted) {
+				t.Fatalf("不成形的暂停该走重跑→升级，实际 %v", err)
+			}
+			if *calls != 2 {
+				t.Errorf("该重跑到预算用尽，实际 %d 次", *calls)
+			}
+		})
+	}
+}
+
+// 答复回来之后，同一段应当能交出通过出口条件的卡。
+func TestBriefUnblocksTheStage(t *testing.T) {
+	dir := t.TempDir()
+	brief := filepath.Join(dir, "brief.json")
+	os.WriteFile(brief, []byte(`{"答复":[{"问题":"活跃的口径","答复":"只统计登录时间",
+		"来源":"im 会话 3f2a… 消息 #12","确认时间":"2026-09-16T06:10:00Z"}]}`), 0o644)
+
+	var got string
+	w := WorkerFunc(func(_ context.Context, p string) error {
+		got = p
+		return os.WriteFile(filepath.Join(dir, "需求定义卡.json"), []byte(`{
+			"目标":"做活跃度看板","范围内":["日活"],"范围外":["不做留存"],
+			"验收标准":"p99 < 500ms","确认状态":"confirmed",
+			"确认来源":"im 会话 3f2a… 消息 #12"}`), 0o644)
+	})
+
+	err := Runner{
+		Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+		Brief: brief, Budget: 1, Worker: w,
+	}.Run(context.Background(), "01")
+	if err != nil {
+		t.Fatalf("有答复就该过: %v", err)
+	}
+	if !strings.Contains(got, "消息 #12") {
+		t.Errorf("prompt 该把答复原文带进去，实际:\n%s", got)
+	}
+	if !strings.Contains(got, "连确认来源") {
+		t.Error("prompt 该要求把确认来源抄进交付物")
+	}
+}
+
+// 没有答复时，prompt 必须明说"不许替他答"——这条是 headless 实测里唯一真正守住的东西。
+func TestNoBriefForbidsAnsweringForTheStakeholder(t *testing.T) {
+	st := loadStages(t)[0] // 01
+	p := buildPrompt(st, "规范正文", nil, "/tmp/卡.json", "做看板", "", nil)
+	if !strings.Contains(p, "不许替他答") || !strings.Contains(p, "待决策") {
+		t.Errorf("没有答复时该要求停下来问，实际:\n%s", p)
+	}
+}
+
 // prompt 里必须把"判定在你自己之外"说清楚，也要把出口字段点名。
 func TestPromptStatesTheBarrier(t *testing.T) {
 	st := loadStages(t)[1] // 02
 	p := buildPrompt(st, "规范正文", map[string]pipeline.Artifact{
 		"需求定义卡": {"范围外": []any{"不做留存"}, "确认状态": "confirmed"},
-	}, "/tmp/方案卡.json", "活跃度看板", nil)
+	}, "/tmp/方案卡.json", "活跃度看板", "", nil)
 
 	for _, want := range []string{
 		"判定不在你这儿", "唯一事实源", "上游交付物", "/tmp/方案卡.json",
-		"不要替需求方确认", "影响面",
+		"影响面", "不许替他答", "待决策",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt 缺 %q\n---\n%s", want, p)

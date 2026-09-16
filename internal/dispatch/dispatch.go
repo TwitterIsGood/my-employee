@@ -29,6 +29,13 @@ var ErrRejectedUpstream = errors.New("上游交付被打回，本阶段未启动
 // ErrBudgetExhausted 重跑预算用完仍未达出口条件——该升级给人工指导者，不是继续撞。
 var ErrBudgetExhausted = errors.New("重跑预算用尽，仍未达出口条件")
 
+// ErrAwaitingInput 本阶段把取舍摆给需求方了，停在这儿等答复。
+//
+// 这**不是失败**：重跑多少次都问不出需求方本人的答案。它是一次正常的中断，
+// 答复回来（--brief）再叫醒同一段。把它和"撞南墙"分开，是为了不让人去修一个
+// 本来就该等人回答的东西。
+var ErrAwaitingInput = errors.New("在等需求方的答复")
+
 // Worker 是一次唤醒的抽象。Agent 阶段与非 Agent 阶段（07 回归）只是命令不同，
 // 判定逻辑完全一样。
 type Worker interface {
@@ -69,6 +76,7 @@ type Runner struct {
 	Budget   int    // 出口未过时的重跑上限
 	Worker   Worker
 	Item     string // 需求名，进 Agent 的上下文与驳回记录
+	Brief    string // 需求方的答复（JSON）；后台唯一的"确认"来源
 	Log      io.Writer
 }
 
@@ -99,6 +107,10 @@ func (r Runner) Run(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	brief, err := r.brief()
+	if err != nil {
+		return err
+	}
 	if err := r.mark(st); err != nil {
 		return err
 	}
@@ -107,7 +119,7 @@ func (r Runner) Run(ctx context.Context, id string) error {
 	var last []pipeline.Violation
 	for attempt := 1; attempt <= r.Budget; attempt++ {
 		r.logf("—— 阶段 %s（%s）第 %d/%d 次唤醒 ——\n", st.ID, st.Name, attempt, r.Budget)
-		if err := r.Worker.Run(ctx, buildPrompt(st, spec, arts, out, r.Item, last)); err != nil {
+		if err := r.Worker.Run(ctx, buildPrompt(st, spec, arts, out, r.Item, brief, last)); err != nil {
 			return fmt.Errorf("阶段 %s 的唤醒失败: %w", st.ID, err)
 		}
 
@@ -128,6 +140,16 @@ func (r Runner) Run(ctx context.Context, id string) error {
 		if len(last) == 0 {
 			r.logf("阶段 %s 的交付通过出口条件：%s\n", st.ID, st.Produces)
 			return nil
+		}
+
+		// 出口没过，但交付物里写着"我在等需求方拍板"——那是在等人，不是在失败。
+		// 先判这个，否则重跑预算会浪费在问一个问不出答案的问题上。
+		decisions, ok := pauseItems(a, st.PauseOn)
+		if ok {
+			if err := r.ask(st, decisions); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w：阶段 %s 有 %d 项要需求方定夺", ErrAwaitingInput, st.ID, len(decisions))
 		}
 		r.retry(st, attempt, last)
 	}
@@ -220,6 +242,85 @@ func (r Runner) retry(st pipeline.Stage, attempt int, vs []pipeline.Violation) {
 	}
 }
 
+// decision 是交付物里"要需求方定夺"的一项。
+//
+// 每一项**必须**带至少两个选项及各自动代价。不带代价的选项是把技术清单丢给需求方，
+// 不带选项的"需要你决定"是把后台的纠结原样倒过去——两种投影层都会拦。
+type decision struct {
+	Question string   `json:"问题"`
+	Options  []option `json:"选项"`
+}
+
+type option struct {
+	Choice string `json:"选项"`
+	Cost   string `json:"代价"`
+}
+
+// pauseItems 看交付物是不是在等人。ok=false 表示"不是合法的暂停"——
+// 字段缺失、为空、或者写得不成形，都会掉回重跑的路。**说不清的暂停不算暂停**，
+// 否则"我在等人"就成了一条绕开出口条件的捷径。
+func pauseItems(a pipeline.Artifact, field string) ([]decision, bool) {
+	if field == "" {
+		return nil, false
+	}
+	raw, present := a[field]
+	if !present {
+		return nil, false
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, false
+	}
+	var items []decision
+	if err := json.Unmarshal(b, &items); err != nil || len(items) == 0 {
+		return nil, false
+	}
+	for _, d := range items {
+		if strings.TrimSpace(d.Question) == "" || len(d.Options) < 2 {
+			return nil, false
+		}
+		for _, o := range d.Options {
+			if strings.TrimSpace(o.Choice) == "" || strings.TrimSpace(o.Cost) == "" {
+				return nil, false
+			}
+		}
+	}
+	return items, true
+}
+
+// ask 把待定夺的取舍摆到台面上。它们经投影后前台看得到，需求方的答复再由前台带回来。
+func (r Runner) ask(st pipeline.Stage, ds []decision) error {
+	for i, d := range ds {
+		options := make([]any, 0, len(d.Options))
+		for _, o := range d.Options {
+			options = append(options, o.Choice+"："+o.Cost)
+		}
+		if err := r.write(map[string]any{
+			"type":      "decision_needed",
+			"stage":     st.Name,
+			"summary":   d.Question + " —— 需要需求方定一个方向",
+			"options":   options,
+			"confirmed": true,
+			"evidence":  fmt.Sprintf("阶段 %s 交付物 %s[%d]", st.ID, st.PauseOn, i),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// brief 读需求方的答复。这是后台唯一的"确认"来源——没有它，Agent 只许写 assumed。
+func (r Runner) brief() (string, error) {
+	if r.Brief == "" {
+		return "", nil
+	}
+	b, err := os.ReadFile(r.Brief)
+	if err != nil {
+		return "", fmt.Errorf("读不到需求方答复 %s: %w", r.Brief, err)
+	}
+	return string(b), nil
+}
+
 // escalate 连续没过之后上报人工。这是流水线的出口，不是又一个重试。
 func (r Runner) escalate(st pipeline.Stage, vs []pipeline.Violation) error {
 	reasons := make([]string, 0, len(vs))
@@ -268,7 +369,7 @@ func (r Runner) logf(format string, args ...any) {
 //
 // 关键的一行是"判定不在你这儿"：Agent 看不到判定过程，所以它没法跟判定讲价，
 // 只能把交付物改到过为止。
-func buildPrompt(st pipeline.Stage, spec string, arts map[string]pipeline.Artifact, out, item string, last []pipeline.Violation) string {
+func buildPrompt(st pipeline.Stage, spec string, arts map[string]pipeline.Artifact, out, item, brief string, last []pipeline.Violation) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "你只做这一段：阶段 %s「%s」。\n\n", st.ID, st.Name)
@@ -300,6 +401,17 @@ func buildPrompt(st pipeline.Stage, spec string, arts map[string]pipeline.Artifa
 	b.WriteString("- 不要把结论写在对话里，写进文件；\n")
 	b.WriteString("- 判不过的字段不要绕过去，也不要自己声明自己做完了；\n")
 	b.WriteString("- 拿不准的就照实写拿不准（例如确认状态写 `assumed`），**不要替需求方确认**。\n\n")
+
+	b.WriteString("## 需求方的答复（你唯一的确认来源）\n\n")
+	if strings.TrimSpace(brief) == "" {
+		b.WriteString("（还没有答复。）所以：凡是要需求方本人拍板的事，**不许替他答**。\n")
+		b.WriteString("把这类事写进交付物的 `待决策`（每项带 ≥2 个选项及各自动代价），本阶段就停在这儿等人。\n")
+		b.WriteString("该确认的字段照实写 `assumed`，被驳回也不许改成 `confirmed`——改了就是替他做决定。\n\n")
+	} else {
+		b.WriteString("```json\n" + brief + "\n```\n\n")
+		b.WriteString("只有这里出现的答复才算数，连确认来源（哪条消息）一起抄进交付物。\n")
+		b.WriteString("这里没答到的问题，仍然写进 `待决策` 继续等，不要自己补一个答案。\n\n")
+	}
 
 	if item != "" {
 		fmt.Fprintf(&b, "## 需求\n\n%s\n\n", item)
