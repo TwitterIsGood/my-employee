@@ -14,6 +14,8 @@
 ```
 
 交付标准是「**安全生产六要两不要**」——见 [`standards/delivery.md`](standards/delivery.md)。
+每个阶段**额外**要守什么、以及它的**入口条件与驳回权**，见 [`standards/stages/`](standards/stages/index.md)。
+顶层准则和阶段规范不重复：全局准则在 `delivery.md` 里只写一遍，阶段文件只说"这一段要守第几条"。
 
 ## 架构：两个平面，不可混为一谈
 
@@ -55,7 +57,9 @@ cmd/gate/                  前台上下文闸门 —— UserPromptSubmit hook，
 cmd/projector/             投影器 CLI
 cmd/egress-listener/       出口观测器（验证「备胎真的生效了」）
 internal/projection/       投影与校验（纯函数，回归闸 = projection_test.go）
+internal/spec/             阶段 spec 树自己的完整性测试（契约缺一节就失败）
 standards/delivery.md      六要两不要（单一事实源，双渲染成散文 + 闸门谓词）
+standards/stages/          阶段 spec 树：7 个阶段各自的入口/出口/闸门/驳回权
 standards/projection.md    投影规则（前台能看到的 vs 看不到的）
 standards/resilience.md    上游韧性（从一个真实故障里总结）
 front/                     前台：大总管指令、假 IM 适配器、延迟探针
