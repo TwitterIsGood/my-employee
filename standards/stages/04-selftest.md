@@ -58,3 +58,32 @@
 - ❌ "测试已在之前跑过。" → 之前的结论不等于这次变更的结论。
 - ❌ 只有行覆盖率数字，说不出哪些**场景**没覆盖。
 - ❌ 数据迁移只在本机跑通就往下走 → 准则 1 明确要求测试环境。
+
+## 契约（机器可读）
+
+`未覆盖场景` 用 `present` 而不是 `nonempty`：这个字段存在的意义是"说清楚没覆盖什么"，
+空数组（"没有未覆盖场景"）是一个合法的、明确的回答；缺字段不是。
+
+```json
+{
+  "id": "04",
+  "name": "自测",
+  "produces": "测试报告",
+  "entry": [
+    { "from": "变更卡", "field": "diff", "check": "nonempty" },
+    { "from": "变更卡", "field": "失败记录", "check": "present" }
+  ],
+  "exit": [
+    { "field": "测试命令", "check": "nonempty" },
+    { "field": "退出码", "check": "equals", "value": 0 },
+    { "field": "未覆盖场景", "check": "present" },
+    {
+      "when": [{ "field": "触及数据路径", "check": "is_true" }],
+      "field": "测试环境日志",
+      "check": "nonempty"
+    }
+  ],
+  "reject_to": "03"
+}
+```
+

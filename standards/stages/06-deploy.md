@@ -65,3 +65,42 @@
 - ❌ 回滚方案写"回滚代码到上一版本"。→ 不是可执行步骤，准则 3 明确要求。
 - ❌ 观测到异常后先回滚、再周知。→ 顺序反了，准则 7 要求上报在继续任何操作**之前**。
 - ❌ 通过 Staging 环境的连接串去改线上数据。→ 准则 8。
+
+## 契约（机器可读）
+
+六字段写死在 `entry` 里——变更卡缺一个字段，06 连开工的资格都没有，这是准则 3 的机器形态。
+`故障上报` 那条带前置：没观测到异常时不要求它，观测到了就必须置位。
+
+```json
+{
+  "id": "06",
+  "name": "部署验证",
+  "produces": "上线记录",
+  "entry": [
+    { "from": "审查记录", "field": "结论", "check": "equals", "value": "通过" },
+    { "from": "审查记录", "field": "未覆盖范围", "check": "present" },
+    { "from": "变更卡", "field": "测试报告", "check": "nonempty" },
+    { "from": "变更卡", "field": "变更时间", "check": "nonempty" },
+    { "from": "变更卡", "field": "变更步骤", "check": "min_items", "value": 2 },
+    { "from": "变更卡", "field": "变更风险", "check": "nonempty" },
+    { "from": "变更卡", "field": "观测指标", "check": "nonempty" },
+    { "from": "变更卡", "field": "回滚方案", "check": "nonempty" }
+  ],
+  "exit": [
+    { "field": "观测记录", "check": "min_items", "value": 2 },
+    { "field": "回滚预演日志", "check": "nonempty" },
+    {
+      "when": [{ "field": "观测到异常", "check": "is_true" }],
+      "field": "故障上报",
+      "check": "is_true"
+    }
+  ],
+  "reject_to": "05",
+  "reject_upstream": { "变更卡": "03" }
+}
+```
+
+`变更步骤` 用 `min_items: 2` 落地准则 4 的「至少两级影响面递进」——一步到全量的序列在结构上就过不了。
+
+`reject_upstream` 落地上面驳回权表的第一行：**变更卡缺字段是 03 的活，不是 05 的活**。
+少了这一句，机器会把"变更卡缺字段"也打回 05，而 05 手里根本没有那张卡——上游会收不到该补的东西。

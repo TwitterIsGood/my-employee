@@ -23,6 +23,7 @@ var requiredSections = []string{
 	"## 驳回权",
 	"## 证据",
 	"## 反例",
+	"## 契约（机器可读）",
 }
 
 func stagesDir() string {

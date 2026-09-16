@@ -54,3 +54,30 @@
 - ❌ 关键指标无基线，凭"看起来正常"通过。
 - ❌ 人工写一句"回归已通过"填进报告。→ 本阶段不接受人工结论。
 - ❌ 确认回退后先修再报，跳过了准则 7。
+
+## 契约（机器可读）
+
+`基线对比` 用 `present`：本阶段不接受"没有基线"这种状态，字段必须在，内容哪怕是"与上一版一致"。
+
+```json
+{
+  "id": "07",
+  "name": "回归",
+  "produces": "回归报告",
+  "entry": [
+    { "from": "上线记录", "field": "观测记录", "check": "min_items", "value": 2 },
+    { "from": "上线记录", "field": "故障上报", "check": "present" }
+  ],
+  "exit": [
+    { "field": "全量套件退出码", "check": "equals", "value": 0 },
+    { "field": "基线对比", "check": "present" },
+    {
+      "when": [{ "field": "有回退", "check": "is_true" }],
+      "field": "告警已确认",
+      "check": "is_true"
+    }
+  ],
+  "reject_to": "06"
+}
+```
+

@@ -61,3 +61,35 @@
 - ❌ 开发自己审自己。→ 角色不隔离。
 - ❌ 结论写"基本可以上线，小问题后续优化"。→ 没有 `通过/驳回` 二值，06 无法据此决策。
 - ❌ 提了一堆"可能有问题的地方"但没有一条能复现。→ 那是噪声，不是审查产出。
+
+## 契约（机器可读）
+
+`结论 ∈ {通过, 驳回}` 用 `one_of` 落地——"基本可以上线"是写不进去的，它不是一个合法的值。
+
+```json
+{
+  "id": "05",
+  "name": "对抗式审查",
+  "produces": "审查记录",
+  "entry": [
+    { "from": "测试报告", "field": "退出码", "check": "present" },
+    { "from": "测试报告", "field": "未覆盖场景", "check": "present" }
+  ],
+  "exit": [
+    { "field": "结论", "check": "one_of", "value": ["通过", "驳回"] },
+    { "field": "证伪尝试", "check": "min_items", "value": 1 },
+    {
+      "when": [{ "field": "结论", "check": "equals", "value": "通过" }],
+      "field": "未覆盖范围",
+      "check": "nonempty"
+    },
+    {
+      "when": [{ "field": "结论", "check": "equals", "value": "驳回" }],
+      "field": "反例",
+      "check": "nonempty"
+    }
+  ],
+  "reject_to": "04"
+}
+```
+

@@ -55,3 +55,29 @@
 
 - ❌ **真实事故**："活跃度可能可以直接从已有的 audit_log 推出来"（`hypothesis`）被当成方案推进，两轮之后才发现 `audit_log` 没有 `(user_id, created_at)` 复合索引，单用户 7 天窗口退化成顺序扫描、42.7 秒超时。→ 一条没标注的假设，烧掉了整个 03 阶段。
 - ❌ "开发和审查对要不要加缓存有分歧，他们在讨论。" → 后台争论属于投影黑名单（`debate`）；有明确二选一就产出 `decision_needed` 带选项。
+
+## 契约（机器可读）
+
+`未标注推断` 要求为 `empty`：方案卡必须显式回答"还有没有没标注的推断"，答案是"没有"才放行。
+把它写成 `[]` 是允许的，缺了这个字段不是——**说不清 = 未落地**。
+
+```json
+{
+  "id": "02",
+  "name": "技术方案设计",
+  "produces": "方案卡",
+  "entry": [
+    { "from": "需求定义卡", "field": "范围外", "check": "nonempty" },
+    { "from": "需求定义卡", "field": "确认状态", "check": "equals", "value": "confirmed" }
+  ],
+  "exit": [
+    { "field": "做法", "check": "nonempty" },
+    { "field": "影响面", "check": "nonempty" },
+    { "field": "风险", "check": "min_items", "value": 1 },
+    { "field": "验证方式", "check": "nonempty" },
+    { "field": "未标注推断", "check": "empty" }
+  ],
+  "reject_to": "01"
+}
+```
+

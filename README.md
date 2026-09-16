@@ -55,8 +55,10 @@ Go，除 `front/` 那个假 IM 适配器（一次性的、换真飞书时整块�
 ```
 cmd/gate/                  前台上下文闸门 —— UserPromptSubmit hook，非 Agent
 cmd/projector/             投影器 CLI
+cmd/pipeline/              后台流水线判定器（入口/出口条件、驳回）
 cmd/egress-listener/       出口观测器（验证「备胎真的生效了」）
 internal/projection/       投影与校验（纯函数，回归闸 = projection_test.go）
+internal/pipeline/         阶段契约的加载与判定（入口条件即上游的验收标准）
 internal/spec/             阶段 spec 树自己的完整性测试（契约缺一节就失败）
 standards/delivery.md      六要两不要（单一事实源，双渲染成散文 + 闸门谓词）
 standards/stages/          阶段 spec 树：7 个阶段各自的入口/出口/闸门/驳回权
@@ -77,11 +79,18 @@ local/                     gitignored：凭据、Agent settings、运行时状�
 ## 复现
 
 ```bash
-make build        # 产出 local/bin/{gate,projector,egress-listener}
-make test         # 投影层回归闸，10 项断言
+make build        # 产出 local/bin/{gate,projector,pipeline,egress-listener}
+make test         # 投影层回归闸 + 阶段契约 + 流水线判定
 
 # 只看投影：后台事件 -> 前台唯一可见的状态文档
-./local/bin/projector back/fixtures/events-active-users.jsonl --out /tmp/proj.md
+./local/bin/projector back/fixtures/events-active-users.jsonl --out local/tmp/proj.md
+
+# 后台流水线：阶段契约就是流水线定义
+./local/bin/pipeline stages
+./local/bin/pipeline gate 02 entry back/fixtures/entry-02-reject.json --item 活跃度看板
+# 驳回 -> 一条 blocker 事件 -> 前台看到「卡在哪」
+./local/bin/pipeline gate 02 entry back/fixtures/entry-02-reject.json \
+    --item 活跃度看板 --events local/tmp/events.jsonl
 
 # 假 IM 适配器（用 multica chat API 当传输层）
 cd front

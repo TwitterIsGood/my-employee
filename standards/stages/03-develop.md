@@ -55,3 +55,29 @@ diff + 每次验证的命令与输出 + `failure` 记录的 `where`/`cause`/`evi
 - ❌ **真实事故（验证 A）**：前台把"已确认需求并准备交给开发团队"、"这次会按后端数据口径和后台页面一起实现"讲给了需求方。→ 两句都是 `intent`，**事还没发生**。类型上属于投影黑名单，`confirmed` 门上也不该过。
 - ❌ "第 2 次尝试从 audit_log 推导活跃度，仍然超时。" → `retry`，是过程，不是事实。正确上报是把 `where`/`cause` 定位清楚的 `failure`。
 - ❌ "卡住了，我再试试别的办法。" → 没报卡在**什么**上，前台无法据此升级。
+
+## 契约（机器可读）
+
+入口带上 02 的 `未标注推断: empty`——**在假设上开工**是这一刀要挡掉的东西。
+`失败记录` 要求 `present`：可以是 `[]`（真的一次没失败），但必须显式写出来。
+
+```json
+{
+  "id": "03",
+  "name": "本地开发",
+  "produces": "变更卡",
+  "entry": [
+    { "from": "方案卡", "field": "做法", "check": "nonempty" },
+    { "from": "方案卡", "field": "影响面", "check": "nonempty" },
+    { "from": "方案卡", "field": "未标注推断", "check": "empty" },
+    { "from": "需求定义卡", "field": "验收标准", "check": "nonempty" }
+  ],
+  "exit": [
+    { "field": "diff", "check": "nonempty" },
+    { "field": "scope", "check": "nonempty" },
+    { "field": "失败记录", "check": "present" }
+  ],
+  "reject_to": "02"
+}
+```
+
