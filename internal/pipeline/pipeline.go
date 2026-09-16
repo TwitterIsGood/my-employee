@@ -164,6 +164,19 @@ func validateChain(stages []Stage) error {
 	return nil
 }
 
+// SpecPath 找某个阶段的 spec 文件。散文形态与谓词形态住在同一个文件里，
+// 所以唤醒一个阶段的 Agent 时给它读的就是这一份，避免两处各说各话。
+func SpecPath(dir, id string) (string, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, id+"-*.md"))
+	if err != nil {
+		return "", err
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("在 %s 里没有阶段 %s 的 spec", dir, id)
+	}
+	return matches[0], nil
+}
+
 // ByID 取某个阶段。
 func ByID(stages []Stage, id string) (Stage, bool) {
 	for _, s := range stages {
@@ -379,12 +392,19 @@ func SelfReject(stage Stage, item string, vs []Violation) Rejection {
 // 这一条是后台与前台的接缝：驳回在这里产出，经 cmd/gate 投影后，需求方看到的
 // 是"卡在哪、因为哪几条"——看不到后台来回打了几轮、谁跟谁有分歧。
 func (r Rejection) Event() map[string]any {
+	// From == By 是出口不通过的自己退自己，措辞不能写成"被自己打回"。
+	summary := fmt.Sprintf("阶段 %s 的交付被 %s 打回（%d 条不通过）", r.From, r.By, len(r.Reasons))
+	evidence := fmt.Sprintf("pipeline: 阶段 %s 入口判定，需求 %q", r.By, r.Item)
+	if r.From == r.By {
+		summary = fmt.Sprintf("阶段 %s 的交付未达出口条件（%d 条）", r.From, len(r.Reasons))
+		evidence = fmt.Sprintf("pipeline: 阶段 %s 出口判定，需求 %q", r.By, r.Item)
+	}
 	return map[string]any{
 		"type":      "blocker",
 		"stage":     r.From,
-		"summary":   fmt.Sprintf("阶段 %s 的交付被 %s 打回（%d 条不通过）", r.From, r.By, len(r.Reasons)),
+		"summary":   summary,
 		"on":        strings.Join(r.Reasons, "；"),
 		"confirmed": true,
-		"evidence":  fmt.Sprintf("pipeline: 阶段 %s 入口判定，需求 %q", r.By, r.Item),
+		"evidence":  evidence,
 	}
 }

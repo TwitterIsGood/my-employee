@@ -4,7 +4,7 @@ BIN := local/bin
 
 all: build
 
-build: $(BIN)/gate $(BIN)/projector $(BIN)/pipeline $(BIN)/egress-listener
+build: $(BIN)/gate $(BIN)/projector $(BIN)/pipeline $(BIN)/stage $(BIN)/egress-listener
 
 $(BIN)/gate: $(shell find cmd internal -name '*.go' 2>/dev/null)
 	go build -o $@ ./cmd/gate
@@ -14,6 +14,9 @@ $(BIN)/projector: $(shell find cmd internal -name '*.go' 2>/dev/null)
 
 $(BIN)/pipeline: $(shell find cmd internal standards -type f 2>/dev/null)
 	go build -o $@ ./cmd/pipeline
+
+$(BIN)/stage: $(shell find cmd internal standards -type f 2>/dev/null)
+	go build -o $@ ./cmd/stage
 
 $(BIN)/egress-listener: $(shell find cmd internal -name '*.go' 2>/dev/null)
 	go build -o $@ ./cmd/egress-listener

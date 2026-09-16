@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/TwitterIsGood/my-employee/internal/events"
 	"github.com/TwitterIsGood/my-employee/internal/pipeline"
 )
 
@@ -194,60 +195,13 @@ func readSource(src string) ([]byte, error) {
 	return os.ReadFile(src)
 }
 
-// appendBlocker 把驳回写进后台事件日志。seq 递增，与投影层的输入格式一致。
+// appendBlocker 把驳回写进后台事件日志。
 func appendBlocker(path string, rej pipeline.Rejection) (map[string]any, error) {
-	seq, trailing, err := nextSeq(path)
-	if err != nil {
-		return nil, err
-	}
 	ev := rej.Event()
+	seq, err := events.Append(path, ev)
+	if err != nil {
+		return nil, err
+	}
 	ev["seq"] = seq
-
-	line, err := json.Marshal(ev)
-	if err != nil {
-		return nil, err
-	}
-
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	prefix := ""
-	if !trailing {
-		prefix = "\n"
-	}
-	if _, err := f.WriteString(prefix + string(line) + "\n"); err != nil {
-		return nil, err
-	}
 	return ev, nil
-}
-
-// nextSeq 读出现有最大 seq，返回下一个；同时告诉调用方文件末尾有没有换行。
-func nextSeq(path string) (int, bool, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 1, true, nil
-		}
-		return 0, false, err
-	}
-	if len(b) == 0 {
-		return 1, true, nil
-	}
-	max := 0
-	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var ev map[string]any
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
-		}
-		if n, ok := ev["seq"].(float64); ok && int(n) > max {
-			max = int(n)
-		}
-	}
-	return max + 1, b[len(b)-1] == '\n', nil
 }

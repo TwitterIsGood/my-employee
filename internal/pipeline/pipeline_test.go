@@ -288,6 +288,9 @@ func TestExitFailureIsSelfRejection(t *testing.T) {
 	if rej.From == s02.RejectTo {
 		t.Error("出口不通过不该打回上游——上游没错")
 	}
+	if s := rej.Event()["summary"].(string); strings.Contains(s, "被 02 打回") {
+		t.Errorf("自己退自己不该写成「被自己打回」，实际 %q", s)
+	}
 }
 
 // 驳回要能变成前台的可见事实：一条 blocker 事件。

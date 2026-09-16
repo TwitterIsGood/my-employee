@@ -56,9 +56,12 @@ Go，除 `front/` 那个假 IM 适配器（一次性的、换真飞书时整块�
 cmd/gate/                  前台上下文闸门 —— UserPromptSubmit hook，非 Agent
 cmd/projector/             投影器 CLI
 cmd/pipeline/              后台流水线判定器（入口/出口条件、驳回）
+cmd/stage/                 把某个阶段派给一次唤醒（判入口 → 唤醒 → 判出口）
 cmd/egress-listener/       出口观测器（验证「备胎真的生效了」）
 internal/projection/       投影与校验（纯函数，回归闸 = projection_test.go）
 internal/pipeline/         阶段契约的加载与判定（入口条件即上游的验收标准）
+internal/dispatch/         一次唤醒跑一个阶段：上游不够不启动，自己没交好带原因重跑
+internal/events/           后台事件日志的写入口（seq + JSONL）
 internal/spec/             阶段 spec 树自己的完整性测试（契约缺一节就失败）
 standards/delivery.md      六要两不要（单一事实源，双渲染成散文 + 闸门谓词）
 standards/stages/          阶段 spec 树：7 个阶段各自的入口/出口/闸门/驳回权
@@ -79,8 +82,8 @@ local/                     gitignored：凭据、Agent settings、运行时状�
 ## 复现
 
 ```bash
-make build        # 产出 local/bin/{gate,projector,pipeline,egress-listener}
-make test         # 投影层回归闸 + 阶段契约 + 流水线判定
+make build        # 产出 local/bin/{gate,projector,pipeline,stage,egress-listener}
+make test         # 投影层回归闸 + 阶段契约 + 流水线判定 + 派活
 
 # 只看投影：后台事件 -> 前台唯一可见的状态文档
 ./local/bin/projector back/fixtures/events-active-users.jsonl --out local/tmp/proj.md
@@ -91,6 +94,13 @@ make test         # 投影层回归闸 + 阶段契约 + 流水线判定
 # 驳回 -> 一条 blocker 事件 -> 前台看到「卡在哪」
 ./local/bin/pipeline gate 02 entry back/fixtures/entry-02-reject.json \
     --item 活跃度看板 --events local/tmp/events.jsonl
+
+# 派一个阶段给一次唤醒：判上游 -> 唤醒 -> 判交付
+./local/bin/stage run 01 --dir local/tmp/art \
+    --item "我想要个活跃度看板" --events local/tmp/events.jsonl --budget 2 \
+    --worker-cmd "claude -p --settings local/agents/stage-worker.settings.json \
+                  --dangerously-skip-permissions"
+# 非 Agent 阶段（07 回归）换 --worker-cmd 就行，判定逻辑完全一样
 
 # 假 IM 适配器（用 multica chat API 当传输层）
 cd front
