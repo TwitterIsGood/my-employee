@@ -18,6 +18,17 @@
 
 **要求**：单次上游调用必须有**硬超时**；超时后立刻**降级到下一个出口**，而不是原地重试。总时长上限应是"人类还愿意等"的量级（前台 ≤ 10s）。
 
+**界在哪**：本机 `~/.claude/settings.json` 里写着 `API_TIMEOUT_MS=3000000`——**50 分钟**。
+不设这个值，就默认拿 50 分钟当单次超时，202s / 402s 的"慢失败"就是这么来的。
+出口配置里必须显式压到秒级（本次用 30000ms）。
+
+**实测对照**（同一个 Agent、同一句需求方消息）：
+
+| 出口 | TOTAL | 结果 |
+|---|---|---|
+| 主通道（overloaded） | 205.9s / 202.3s / 402s | 503/502 原文交给需求方 |
+| 备胎（DeepSeek，`--settings` 覆盖后） | **3.3s** | 正常回复 |
+
 ## 3. 上游错误不许透传给需求方
 
 前台把 `503 auth_unavailable: no auth available (providers=codex...)` 原样送进了聊天窗口。
@@ -34,9 +45,33 @@
 
 本次实测的候选出口：
 
-| 出口 | 状态（2026-09-16） |
-|---|---|
-| `<内网代理>` codex 池 | ❌ 503 overloaded |
-| `<内网代理>` → `gpt-5.5(xhigh)` | ❌ 同一个池子，同样 503 |
-| `api.deepseek.com/anthropic` | ✅ 独立，200 OK，约 4s |
-| <内网机> `:<端口>` (CPA) | ✅ 端口活着，需凭据 |
+| 出口 | 状态（2026-09-16） | 实测方式 |
+|---|---|---|
+| `<内网代理>` codex 池 | ❌ 503 overloaded | Agent 端到端，205.9s 才失败 |
+| `<内网代理>` → `gpt-5.5(xhigh)` | ❌ 同一个池子，同样 503 | Agent 端到端，202.3s 才失败 |
+| <内网机> `:<端口>` (CPA) | ❌ 502 overloaded | Agent 端到端，402s 才失败 |
+| `api.deepseek.com/anthropic` | ✅ 独立可用 | 直连 curl 200 OK 1.1s；**Agent 端到端 3.3s** |
+
+## 5. 「已设置」不等于「已生效」
+
+本条是本次最反直觉、也最值得留住的一条。
+
+**实测**：给 Agent 配了 `custom_env` 指向备胎出口，`multica agent env get` 回显一切正常。
+但请求**根本没走那条出口**——它仍然打到 `<内网代理>`，502 烧掉 402 秒。
+
+**根因**：Claude Code CLI 启动时会执行 `Object.assign(process.env, settings.env)`，
+即 `~/.claude/settings.json` 里的 `env` 块**覆盖**继承来的进程环境变量。
+而 multica 的 `custom_env` 是注入进程环境的——所以被无声地覆盖掉了。
+整条链路上没有任何一处报错，配置回显、任务记录、日志全都是"正常"。
+
+**要求**：
+- 出口是否生效，必须用 **egress 观测**验证，不能只看配置回显。
+  工具见 [`tools/egress_listener.py`](../tools/egress_listener.py)：把出口指到本机监听器，
+  发一条消息，日志里**出现 POST 才算这个出口真的在生效**。
+- 覆盖机制必须选**优先级足够高**的那一个。实测 env 的生效顺序（低 → 高）：
+  `继承的进程环境 < user settings < --settings 参数 < 托管策略`。
+  所以 `custom_env`（=`< user settings`）必输；要覆盖就得走
+  `custom_args: ["--settings", "<file>"]`。
+- 本机落地方式：`local/agent-egress.json`（gitignored，含凭据）
+  \+ `multica agent update <id> --custom-args '["--settings","<abs path>"]'`。
+  同时把失效的 `custom_env` **清空**——留着它只会让人以为有备胎。
