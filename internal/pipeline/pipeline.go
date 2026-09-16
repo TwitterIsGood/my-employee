@@ -366,16 +366,21 @@ func (s Stage) target(c Condition) string {
 //
 // 一次入口判定可能同时退回两段：06 的变更卡缺字段回 03，审查记录本身的问题回 05。
 // 合成一条"退回 05"会让 03 不知道要补东西，所以分组是必须的，不是讲究。
+//
+// 组按阶段号升序，不按驳回产生的先后：这一份要经投影摆到前台，也要被驱动整条链路的
+// 一层拿去算回退点，两种用途要的都是链路上的顺序，不是内部遍历的顺序。
 func Reject(stage Stage, item string, vs []Violation) []Rejection {
-	var order []string
 	grouped := map[string][]Violation{}
 	for _, v := range vs {
 		t := stage.target(v.Cond)
-		if _, seen := grouped[t]; !seen {
-			order = append(order, t)
-		}
 		grouped[t] = append(grouped[t], v)
 	}
+	order := make([]string, 0, len(grouped))
+	for t := range grouped {
+		order = append(order, t)
+	}
+	sort.Strings(order)
+
 	out := make([]Rejection, 0, len(order))
 	for _, t := range order {
 		out = append(out, Rejection{

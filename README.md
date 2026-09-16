@@ -57,11 +57,14 @@ cmd/gate/                  前台上下文闸门 —— UserPromptSubmit hook，
 cmd/projector/             投影器 CLI
 cmd/pipeline/              后台流水线判定器（入口/出口条件、驳回）
 cmd/stage/                 把某个阶段派给一次唤醒（判入口 → 唤醒 → 判出口）
+cmd/chain/                 把一条需求走完 01→07（判入口 → 唤醒 → 判出口 → 下一段）
 cmd/egress-listener/       出口观测器（验证「备胎真的生效了」）
 internal/projection/       投影与校验（纯函数，回归闸 = projection_test.go）
 internal/pipeline/         阶段契约的加载与判定（入口条件即上游的验收标准）
 internal/dispatch/         一次唤醒跑一个阶段：上游不够不启动，自己没交好带原因重跑
+internal/chain/            整条链路的状态：走到哪、被打回退到哪、返工几次算撞南墙
 internal/events/           后台事件日志的写入口（seq + JSONL）
+internal/cli/              多个命令共用的小工具（选项分离、默认唤醒命令）
 internal/spec/             阶段 spec 树自己的完整性测试（契约缺一节就失败）
 standards/delivery.md      六要两不要（单一事实源，双渲染成散文 + 闸门谓词）
 standards/stages/          阶段 spec 树：7 个阶段各自的入口/出口/闸门/驳回权
@@ -105,6 +108,13 @@ make test         # 投影层回归闸 + 阶段契约 + 流水线判定 + 派活
 # 口径定不下来时它会停住等人（退出码 3），取舍经投影摆到需求方面前；
 # 答复回来再叫醒同一段——后台唯一的"确认"来源就是这份答复
 ./local/bin/stage run 01 --dir local/tmp/art --brief local/tmp/brief.json …
+
+# 一条需求走完全程：走完一段接着走下一段，被打回就退到最靠前的那一段重走
+./local/bin/chain run --dir local/tmp/art --item "我想要个活跃度看板" \
+    --events local/tmp/events.jsonl --max-rework 2 \
+    --settings local/agents/stage-worker.settings.json \
+    --stage-worker 07='./scripts/regression.sh'   # 非 Agent 阶段只换命令
+# 断在哪写在 local/tmp/art/chain.json 里；带 --brief 再跑一次就从断点接着走
 
 # 假 IM 适配器（用 multica chat API 当传输层）
 cd front

@@ -7,9 +7,34 @@ package events
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"strings"
 )
+
+// Sink 是"往事件日志里记一条"这件事。Path 为空表示不记（测试与一次性跑用得上）。
+//
+// 它同时负责把那句话抄到运行日志上：后台自己也要看得见自己报了什么，
+// 否则事件日志和运行日志对不上时，没人分得清是没记还是记错了。
+type Sink struct {
+	Path string
+	Log  io.Writer
+}
+
+func (s Sink) Write(ev map[string]any) error {
+	if s.Path == "" {
+		return nil
+	}
+	seq, err := Append(s.Path, ev)
+	if err != nil {
+		return err
+	}
+	if s.Log != nil {
+		fmt.Fprintf(s.Log, "事件 seq=%d type=%v：%v\n", seq, ev["type"], ev["summary"])
+	}
+	return nil
+}
 
 // Append 追加一条事件，返回分配给它的 seq。
 //

@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"github.com/TwitterIsGood/my-employee/internal/cli"
 	"github.com/TwitterIsGood/my-employee/internal/dispatch"
 	"github.com/TwitterIsGood/my-employee/internal/pipeline"
 )
@@ -78,7 +78,7 @@ func run(args []string) error {
 		work      = fs.String("work", "", "唤醒命令的工作目录")
 		brief     = fs.String("brief", "", "需求方的答复")
 	)
-	flags, pos := splitFlags(args[1:])
+	flags, pos := cli.SplitFlags(args[1:])
 	if err := fs.Parse(flags); err != nil {
 		return err
 	}
@@ -101,25 +101,16 @@ func run(args []string) error {
 
 	cmd := *workerCmd
 	if cmd == "" {
-		if *settings == "" {
-			return errors.New("默认唤醒命令需要 --settings（挂出口与 hooks 的那份），" +
-				"或者用 --worker-cmd 换一条命令")
-		}
-		// 唤醒命令有自己的工作目录，相对路径在那边解析会找不到文件。
-		abs, err := filepath.Abs(*settings)
-		if err != nil {
+		if cmd, err = cli.DefaultWorkerCmd(*settings); err != nil {
 			return err
 		}
-		cmd = "claude -p --settings " + shellQuote(abs) + " --dangerously-skip-permissions"
 	}
 
 	workDir := *work
 	if workDir == "" {
 		workDir = *dir
 	}
-	if abs, err := filepath.Abs(workDir); err == nil {
-		workDir = abs
-	}
+	workDir = cli.AbsOrSame(workDir)
 
 	return dispatch.Runner{
 		Stages:   stages,
@@ -132,26 +123,4 @@ func run(args []string) error {
 		Log:      os.Stdout,
 		Worker:   dispatch.CmdWorker{Cmd: cmd, Dir: workDir, Log: nil},
 	}.Run(context.Background(), pos[0])
-}
-
-// splitFlags 把 --k v / --k=v 形式的选项与位置参数分开。flag 包只认位置参数之前的
-// 选项，而这个工具的用法天然是"run 03 --dir …"。
-func splitFlags(args []string) (flags, pos []string) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if !strings.HasPrefix(a, "-") || a == "-" {
-			pos = append(pos, a)
-			continue
-		}
-		flags = append(flags, a)
-		if !strings.Contains(a, "=") && i+1 < len(args) {
-			i++
-			flags = append(flags, args[i])
-		}
-	}
-	return flags, pos
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

@@ -416,7 +416,7 @@ func TestBriefUnblocksTheStage(t *testing.T) {
 // 没有答复时，prompt 必须明说"不许替他答"——这条是 headless 实测里唯一真正守住的东西。
 func TestNoBriefForbidsAnsweringForTheStakeholder(t *testing.T) {
 	st := loadStages(t)[0] // 01
-	p := buildPrompt(st, "规范正文", nil, "/tmp/卡.json", "做看板", "", nil)
+	p := buildPrompt(st, "规范正文", nil, "/tmp/卡.json", "做看板", "", nil, nil)
 	if !strings.Contains(p, "不许替他答") || !strings.Contains(p, "待决策") {
 		t.Errorf("没有答复时该要求停下来问，实际:\n%s", p)
 	}
@@ -427,7 +427,7 @@ func TestPromptStatesTheBarrier(t *testing.T) {
 	st := loadStages(t)[1] // 02
 	p := buildPrompt(st, "规范正文", map[string]pipeline.Artifact{
 		"需求定义卡": {"范围外": []any{"不做留存"}, "确认状态": "confirmed"},
-	}, "/tmp/方案卡.json", "活跃度看板", "", nil)
+	}, "/tmp/方案卡.json", "活跃度看板", "", nil, nil)
 
 	for _, want := range []string{
 		"判定不在你这儿", "唯一事实源", "上游交付物", "/tmp/方案卡.json",

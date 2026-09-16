@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/TwitterIsGood/my-employee/internal/events"
@@ -25,6 +26,25 @@ import (
 
 // ErrRejectedUpstream 上游的交付不够开工，本阶段一次都没启动。
 var ErrRejectedUpstream = errors.New("上游交付被打回，本阶段未启动")
+
+// UpstreamRejection 是"上游得先补"这件事本身，带上**打回给哪几段**。
+//
+// 光有一个错误值不够：驱动整条链路的一层必须知道退回哪一段才能重走。回退点取
+// 最靠前的那个——03 的活重做了，04 与 05 的输入就变了，它们的结论也跟着作废。
+type UpstreamRejection struct {
+	Stage   string   // 本阶段（发现上游不够的那一段）
+	Targets []string // 要重做的上游阶段，已去重并升序
+	// Rejections 是逐条的账：谁要补什么。驱动整条链路的一层把它原样递回上游，
+	// 上游才看得见自己缺的是哪几条。
+	Rejections []pipeline.Rejection
+}
+
+func (e *UpstreamRejection) Error() string {
+	return fmt.Sprintf("%v：阶段 %s 的入口条件不满足，打回 %s",
+		ErrRejectedUpstream, e.Stage, strings.Join(e.Targets, "、"))
+}
+
+func (e *UpstreamRejection) Unwrap() error { return ErrRejectedUpstream }
 
 // ErrBudgetExhausted 重跑预算用完仍未达出口条件——该升级给人工指导者，不是继续撞。
 var ErrBudgetExhausted = errors.New("重跑预算用尽，仍未达出口条件")
@@ -77,7 +97,11 @@ type Runner struct {
 	Worker   Worker
 	Item     string // 需求名，进 Agent 的上下文与驳回记录
 	Brief    string // 需求方的答复（JSON）；后台唯一的"确认"来源
-	Log      io.Writer
+	// Reasons 是下游把这份交付打回来时给的条，由驱动整条链路的一层递下来。
+	// 少了它，上游会拿着和上次一模一样的输入再交一遍同样的东西——
+	// 驳回权就成了一道手续，而不是一次补交。
+	Reasons []string
+	Log     io.Writer
 }
 
 // Run 跑一个阶段：先判入口（不够开工就打回上游），再唤醒，再判出口。
@@ -97,10 +121,11 @@ func (r Runner) Run(ctx context.Context, id string) error {
 		return err
 	}
 	if vs := st.CheckEntry(arts); len(vs) > 0 {
-		if err := r.emit(pipeline.Reject(st, r.Item, vs)); err != nil {
+		rejs := pipeline.Reject(st, r.Item, vs)
+		if err := r.emit(rejs); err != nil {
 			return err
 		}
-		return fmt.Errorf("%w：阶段 %s 的入口条件不满足", ErrRejectedUpstream, st.ID)
+		return &UpstreamRejection{Stage: st.ID, Targets: targets(rejs), Rejections: rejs}
 	}
 
 	spec, err := r.spec(st)
@@ -119,7 +144,7 @@ func (r Runner) Run(ctx context.Context, id string) error {
 	var last []pipeline.Violation
 	for attempt := 1; attempt <= r.Budget; attempt++ {
 		r.logf("—— 阶段 %s（%s）第 %d/%d 次唤醒 ——\n", st.ID, st.Name, attempt, r.Budget)
-		if err := r.Worker.Run(ctx, buildPrompt(st, spec, arts, out, r.Item, brief, last)); err != nil {
+		if err := r.Worker.Run(ctx, buildPrompt(st, spec, arts, out, r.Item, brief, r.Reasons, last)); err != nil {
 			return fmt.Errorf("阶段 %s 的唤醒失败: %w", st.ID, err)
 		}
 
@@ -337,6 +362,21 @@ func (r Runner) escalate(st pipeline.Stage, vs []pipeline.Violation) error {
 	})
 }
 
+// targets 把一次入口判定里的打回目标去重并排序。顺序按阶段号，不按驳回产生的
+// 先后——驱动整条链路的一层要拿它算回退点，而阶段号才是链路上的位置。
+func targets(rejs []pipeline.Rejection) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, rej := range rejs {
+		if !seen[rej.From] {
+			seen[rej.From] = true
+			out = append(out, rej.From)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (r Runner) emit(rejs []pipeline.Rejection) error {
 	for _, rej := range rejs {
 		if err := r.write(rej.Event()); err != nil {
@@ -347,15 +387,7 @@ func (r Runner) emit(rejs []pipeline.Rejection) error {
 }
 
 func (r Runner) write(ev map[string]any) error {
-	if r.Events == "" {
-		return nil
-	}
-	seq, err := events.Append(r.Events, ev)
-	if err != nil {
-		return err
-	}
-	r.logf("事件 seq=%d type=%v：%v\n", seq, ev["type"], ev["summary"])
-	return nil
+	return events.Sink{Path: r.Events, Log: r.Log}.Write(ev)
 }
 
 func (r Runner) logf(format string, args ...any) {
@@ -369,7 +401,7 @@ func (r Runner) logf(format string, args ...any) {
 //
 // 关键的一行是"判定不在你这儿"：Agent 看不到判定过程，所以它没法跟判定讲价，
 // 只能把交付物改到过为止。
-func buildPrompt(st pipeline.Stage, spec string, arts map[string]pipeline.Artifact, out, item, brief string, last []pipeline.Violation) string {
+func buildPrompt(st pipeline.Stage, spec string, arts map[string]pipeline.Artifact, out, item, brief string, reasons []string, last []pipeline.Violation) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "你只做这一段：阶段 %s「%s」。\n\n", st.ID, st.Name)
@@ -415,6 +447,17 @@ func buildPrompt(st pipeline.Stage, spec string, arts map[string]pipeline.Artifa
 
 	if item != "" {
 		fmt.Fprintf(&b, "## 需求\n\n%s\n\n", item)
+	}
+
+	// 两种"没过"要分开说：一种是本段自己没干完（出口没过），一种是下游已经把
+	// 这份交付退回来了（入口没过）。它们的改法不一样——前者是接着改，后者是补交，
+	// 而补交要照下游点名的那几条补，多改的都算越界。
+	if len(reasons) > 0 {
+		b.WriteString("## 下游把这份交付退回来了，点名要这几条\n\n")
+		for i, r := range reasons {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, r)
+		}
+		b.WriteString("\n补的就是这几条。别的一律不动——多改的是没被要求改的东西。\n\n")
 	}
 
 	if len(last) > 0 {
