@@ -8,9 +8,11 @@
 #   ./im.sh log  <sid>            打印全部消息
 set -euo pipefail
 
+# 工作区 id 和 agent id 不入库——它们是这个实例的内部标识，仓库是公开的。
+# 跑之前自己指：export MULTICA_WS=... DAGUANJIA_ID=...
 BASE="${MULTICA_BASE:-http://localhost:13000}"
-WS="${MULTICA_WS:-<workspace-id>}"
-AGENT="${DAGUANJIA_ID:-<agent-id>}"
+WS="${MULTICA_WS:?set MULTICA_WS to the workspace id}"
+AGENT="${DAGUANJIA_ID:?set DAGUANJIA_ID to the agent id}"
 TOK="${MULTICA_TOKEN:-$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.multica/config.json')))['token'])")}"
 
 api() {

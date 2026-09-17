@@ -13,7 +13,8 @@ import time
 import urllib.request
 
 BASE = os.environ.get("MULTICA_BASE", "http://localhost:13000")
-WS = os.environ.get("MULTICA_WS", "<workspace-id>")
+# 工作区 id 不入库，理由见 im.sh。
+WS = os.environ["MULTICA_WS"]
 TOK = json.load(open(os.path.expanduser("~/.multica/config.json")))["token"]
 
 

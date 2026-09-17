@@ -1,7 +1,7 @@
 # 验证 A：主 Agent 与人类沟通自然度
 
 **日期** 2026-09-16
-**被测** multica workspace `<工作区>` 里的 agent「大总管」`<agent-id>`
+**被测** multica 里某个 workspace（`<工作区>`）下的 agent「大总管」（`<agent-id>`）
 **运行时** codex / `gpt-5.6-sol` / xhigh（与用户现有团队一致）
 **传输层** multica chat API 当假 IM（`front/im.sh`）
 **原始记录** `runs/2026-09-16_validation-A_run1.txt`

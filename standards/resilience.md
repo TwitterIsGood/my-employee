@@ -1,6 +1,9 @@
 # 上游韧性（从一次真实故障里总结）
 
-2026-09-16 实测故障：`<内网代理>` 的 codex 池返回
+> 本文里的出口一律写作 `<内网代理>` / `<内网机>`，不写真实域名和地址：这个仓库是公开的，
+> 教训该留下，端点标识不该。有 `make check-leaks` 盯着（见 [`leaks.md`](leaks.md)），别改回去。
+
+2026-09-16 实测故障：内网代理（本文一律写作 `<内网代理>`）的 codex 池返回
 `503 auth_unavailable (providers=codex, model=gpt-5.6-sol; server_is_overloaded)`。
 前台 Agent 的表现是：**烧掉 38～202 秒，然后把 503 原文丢给需求方看。**
 
@@ -49,7 +52,7 @@
 |---|---|---|
 | `<内网代理>` codex 池 | ❌ 503 overloaded | Agent 端到端，205.9s 才失败 |
 | `<内网代理>` → `gpt-5.5(xhigh)` | ❌ 同一个池子，同样 503 | Agent 端到端，202.3s 才失败 |
-| <内网机> `:<端口>` (CPA) | ❌ 502 overloaded | Agent 端到端，402s 才失败 |
+| `<内网机>` `:<端口>` (CPA) | ❌ 502 overloaded | Agent 端到端，402s 才失败 |
 | `api.deepseek.com/anthropic` | ✅ 独立可用 | 直连 curl 200 OK 1.1s；**Agent 端到端 3.3s** |
 
 ## 5. 「已设置」不等于「已生效」
