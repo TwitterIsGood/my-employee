@@ -152,13 +152,16 @@ func gate(stages []pipeline.Stage, id, dir, src, events, item string) error {
 	if dir == "exit" {
 		rejs = []pipeline.Rejection{pipeline.SelfReject(st, item, vs)}
 	} else {
-		rejs = pipeline.Reject(st, item, vs)
+		rejs = pipeline.Reject(stages, st, item, vs)
 	}
 
 	for _, rej := range rejs {
 		verb := "退回本阶段重做"
 		if dir == "entry" {
 			verb = "打回 " + rej.From
+			if rej.FromName != "" {
+				verb += "（" + rej.FromName + "）"
+			}
 		}
 		fmt.Printf("驳回：阶段 %s（%s）的%s条件不满足，%s\n\n", st.ID, st.Name, dirName(dir), verb)
 		for i, r := range rej.Reasons {

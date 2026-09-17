@@ -121,7 +121,7 @@ func (r Runner) Run(ctx context.Context, id string) error {
 		return err
 	}
 	if vs := st.CheckEntry(arts); len(vs) > 0 {
-		rejs := pipeline.Reject(st, r.Item, vs)
+		rejs := pipeline.Reject(r.Stages, st, r.Item, vs)
 		if err := r.emit(rejs); err != nil {
 			return err
 		}
@@ -164,7 +164,7 @@ func (r Runner) Run(ctx context.Context, id string) error {
 		last = st.CheckExit(a)
 		if len(last) == 0 {
 			r.logf("阶段 %s 的交付通过出口条件：%s\n", st.ID, st.Produces)
-			return nil
+			return r.accept(st)
 		}
 
 		// 出口没过，但交付物里写着"我在等需求方拍板"——那是在等人，不是在失败。
@@ -252,6 +252,24 @@ func (r Runner) mark(st pipeline.Stage) error {
 		"type":     "progress",
 		"stage":    st.Name,
 		"summary":  "进入阶段 " + st.ID + "（" + st.Name + "）",
+		"evidence": "n/a",
+	})
+}
+
+// accept 记一句"这一段的交付被接受了"。
+//
+// 它存在的唯一理由是给**卡点做消解**：一段被打回过、后来又补交通过，
+// 卡点就该跟着消。没有这条事件，前台会一边写着"全部阶段已完成"，
+// 一边把那条早已解决的卡点继续挂在墙上——那比不报还坏。
+//
+// 用黑名单类型是故意的，和 mark 同一个道理：接受是确定性事实，但没有可出口的细节，
+// 它不进「已发生的变更」那几块，只作为一条**可能消解卡点的状态转移**被投影层读。
+func (r Runner) accept(st pipeline.Stage) error {
+	return r.write(map[string]any{
+		"type":     "progress",
+		"stage":    st.Name,
+		"outcome":  "accepted",
+		"summary":  "阶段 " + st.ID + "（" + st.Name + "）的交付通过出口条件：" + st.Produces,
 		"evidence": "n/a",
 	})
 }

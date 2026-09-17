@@ -42,8 +42,10 @@ func main() {
 		die(err.Error())
 	}
 
-	fmt.Printf("%d 条事件 -> 出口 %d 条，拦下 %d 条（黑名单 %d / 未定论 %d）-> %s\n",
-		res.Total, res.Kept, res.Blacklist+res.Unconfirmed, res.Blacklist, res.Unconfirmed, dst)
+	// 消解单独列出来：它既不是出口也不是"拦下"，
+	// 混进任何一边都会让这几个数加不回 Total，读的人会以为算错了。
+	fmt.Printf("%d 条事件 -> 出口 %d 条，拦下 %d 条（黑名单 %d / 未定论 %d），消解 %d 条 -> %s\n",
+		res.Total, res.Kept, res.Blacklist+res.Unconfirmed, res.Blacklist, res.Unconfirmed, res.Resolved, dst)
 }
 
 func die(msg string) {

@@ -275,13 +275,19 @@ func (r *Runner) finish(sink events.Sink, st State) error {
 
 // stuck 把"不收敛"上报人工指导者。这是链路的出口，不是又一次重试。
 func (r *Runner) stuck(sink events.Sink, st State) error {
+	// stage 写名字，跟别处的「阶段：<名字>」对得上——卡点要能被后续的接受消解，
+	// 而消解是按同一个 stage 值认人的。
+	name := st.Stage
+	if s, ok := pipeline.ByID(r.Stages, st.Stage); ok {
+		name = s.Name
+	}
 	return sink.Write(map[string]any{
 		"type":      "blocker",
-		"stage":     st.Stage,
+		"stage":     name,
 		"summary":   fmt.Sprintf("返工 %d 次仍未收敛，需要人工指导者介入", st.Rework),
 		"on":        st.Note,
 		"confirmed": true,
-		"evidence":  fmt.Sprintf("chain: 返工上限 %d，停在阶段 %s", r.MaxRework, st.Stage),
+		"evidence":  fmt.Sprintf("chain: 返工上限 %d，停在阶段 %s（%s）", r.MaxRework, st.Stage, name),
 	})
 }
 

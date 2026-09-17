@@ -110,6 +110,112 @@ func TestGoodEventPasses(t *testing.T) {
 	}
 }
 
+// —— 卡点是有生命周期的 ——
+//
+// 一段被打回过、后来又补交通过，那条卡点就该跟着消。不消的后果是真实跑出来的：
+// 链路已经走到 07、投影里写着"全部阶段已完成"，墙上却还挂着几小时前那条
+// "03 被打回"——读的人不知道该不该管它。
+
+func blocker(stage, summary string) map[string]any {
+	return map[string]any{
+		"type": "blocker", "stage": stage, "summary": summary,
+		"on": "一条具体原因", "confirmed": true, "evidence": "pipeline: 入口判定",
+	}
+}
+
+func accepted(stage string) map[string]any {
+	return map[string]any{
+		"type": "progress", "stage": stage, "outcome": "accepted",
+		"summary": stage + " 的交付通过出口条件", "evidence": "n/a",
+	}
+}
+
+func TestBlockerIsResolvedWhenThatStageIsAccepted(t *testing.T) {
+	res, err := Build([]map[string]any{
+		blocker("本地开发", "本地开发的交付被部署验证打回（6 条不通过）"),
+		accepted("本地开发"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Text, "打回") {
+		t.Errorf("这一段后来被接受了，卡点不该还挂在墙上:\n%s", res.Text)
+	}
+	if res.Resolved != 1 {
+		t.Errorf("应记 1 条消解，实际 %d", res.Resolved)
+	}
+}
+
+func TestOpenBlockerStays(t *testing.T) {
+	res, err := Build([]map[string]any{
+		blocker("本地开发", "本地开发的交付被部署验证打回（6 条不通过）"),
+		// 只是重新进入这一段，还没交出东西——那不算解决。
+		map[string]any{"type": "progress", "stage": "本地开发", "summary": "进入阶段 03", "evidence": "n/a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Text, "打回") {
+		t.Errorf("还没补交，卡点不该消:\n%s", res.Text)
+	}
+	if res.Resolved != 0 {
+		t.Errorf("不该有消解，实际 %d", res.Resolved)
+	}
+}
+
+// 消解只认**更晚**的接受：先通过、再被打回，卡点是新的那个，不许被旧账抹掉。
+func TestLaterBlockerIsNotResolvedByAnEarlierAccept(t *testing.T) {
+	res, err := Build([]map[string]any{
+		accepted("本地开发"),
+		blocker("本地开发", "本地开发的交付被部署验证打回（6 条不通过）"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Text, "打回") {
+		t.Errorf("先通过后被打回，卡点是在后的那个，不该被旧账抹掉:\n%s", res.Text)
+	}
+}
+
+// 「需要你决定」同理：问题答过了、那一段接着往下走了，就不该再摆在需求方面前——
+// 同一件事问两遍比不问还坏。
+func TestDecisionNeededIsResolvedToo(t *testing.T) {
+	res, err := Build([]map[string]any{
+		{"type": "decision_needed", "stage": "需求澄清", "summary": "活跃度按什么算 —— 需要需求方定一个方向",
+			"options":   []any{"只算登录：漏掉只读不写的人", "登录+业务操作：埋点改造，晚一周"},
+			"confirmed": true, "evidence": "阶段 01 交付物 待决策[0]"},
+		accepted("需求澄清"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Text, "需要你决定") {
+		t.Errorf("答复已经回来了，不该再问一遍:\n%s", res.Text)
+	}
+	if res.Resolved != 1 {
+		t.Errorf("应记 1 条消解，实际 %d", res.Resolved)
+	}
+}
+
+// 已确认的失败/变更/观测是**发生过的事**，撤不掉，也不该撤。
+func TestPastFactsAreNeverResolutioned(t *testing.T) {
+	res, err := Build([]map[string]any{
+		{"type": "failure", "stage": "本地开发", "summary": "聚合查询退化为顺序扫描",
+			"where": "internal/stats/daily.go:88", "cause": "缺复合索引",
+			"confirmed": true, "evidence": "EXPLAIN 输出"},
+		accepted("本地开发"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Text, "退化为顺序扫描") {
+		t.Errorf("失败是发生过的事，不该被后来的接受撤掉:\n%s", res.Text)
+	}
+	if res.Resolved != 0 {
+		t.Errorf("不该有消解，实际 %d", res.Resolved)
+	}
+}
+
 func TestParseRejectsBadJSON(t *testing.T) {
 	if _, err := Parse([]byte("{\"a\":1}\nnot json\n")); err == nil {
 		t.Error("非法 JSON 行应该报错")

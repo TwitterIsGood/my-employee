@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +87,7 @@ func TestEntryRejectsVagueRequirement(t *testing.T) {
 			if len(vs) == 0 {
 				t.Fatal("这份需求定义卡应该在 02 的入口被拦下")
 			}
-			rejs := Reject(s02, "活跃度看板", vs)
+			rejs := Reject(loadReal(t), s02, "活跃度看板", vs)
 			if len(rejs) != 1 {
 				t.Fatalf("卡片上两个字段都来自 01，应合成 1 条驳回，实际 %d 条", len(rejs))
 			}
@@ -248,7 +249,7 @@ func TestRejectionSplitsByTarget(t *testing.T) {
 	if len(vs) == 0 {
 		t.Fatal("这份上游交付应该被拦下")
 	}
-	rejs := Reject(s06, "活跃度看板", vs)
+	rejs := Reject(loadReal(t), s06, "活跃度看板", vs)
 	byTarget := map[string]Rejection{}
 	for _, r := range rejs {
 		byTarget[r.From] = r
@@ -288,8 +289,10 @@ func TestExitFailureIsSelfRejection(t *testing.T) {
 	if rej.From == s02.RejectTo {
 		t.Error("出口不通过不该打回上游——上游没错")
 	}
-	if s := rej.Event()["summary"].(string); strings.Contains(s, "被 02 打回") {
-		t.Errorf("自己退自己不该写成「被自己打回」，实际 %q", s)
+	// 判据要卡在"没写成被打回"上，不能卡在某个具体编号上——
+	// 编号已经不进 summary 了（那里只放名字），照编号断言会变成一条永远为真的空断言。
+	if s := rej.Event()["summary"].(string); strings.Contains(s, "打回") {
+		t.Errorf("自己退自己不该写成「被打回」——上游没错，是这一段没干完，实际 %q", s)
 	}
 }
 
@@ -297,7 +300,7 @@ func TestExitFailureIsSelfRejection(t *testing.T) {
 func TestRejectionEventIsProjectable(t *testing.T) {
 	s02, _ := ByID(loadReal(t), "02")
 	card := art(t, `{"目标":"做看板","范围内":["日活"],"范围外":[],"验收标准":"p99 < 500ms","确认状态":"confirmed"}`)
-	rejs := Reject(s02, "活跃度看板", s02.CheckEntry(map[string]Artifact{"需求定义卡": card}))
+	rejs := Reject(loadReal(t), s02, "活跃度看板", s02.CheckEntry(map[string]Artifact{"需求定义卡": card}))
 	if len(rejs) != 1 {
 		t.Fatalf("应恰好 1 条驳回，实际 %d", len(rejs))
 	}
@@ -313,8 +316,13 @@ func TestRejectionEventIsProjectable(t *testing.T) {
 	if ev["confirmed"] != true {
 		t.Error("驳回是已确认的事实，confirmed 必须为 true")
 	}
-	if ev["stage"] != "01" {
-		t.Errorf("打回 01 后流水线回到 01，stage 应为 01，实际 %v", ev["stage"])
+	// stage 写的是名字不是编号：卡点要跟别处的「阶段：<名字>」对得上，
+	// 不然同一条卡点在两处显示成两个样子，读的人还得自己去对一张表。
+	if ev["stage"] != "需求澄清" {
+		t.Errorf("打回 01 后流水线回到「需求澄清」，stage 应为名字，实际 %v", ev["stage"])
+	}
+	if !strings.Contains(fmt.Sprint(ev["summary"]), "需求澄清") {
+		t.Errorf("summary 也该说人话，实际 %v", ev["summary"])
 	}
 }
 

@@ -168,8 +168,10 @@ func TestVagueUpstreamRejectsAndPointsAtProducer(t *testing.T) {
 	if len(evs) != 1 || evs[0]["type"] != "blocker" {
 		t.Fatalf("应留下一条 blocker，实际 %v", evs)
 	}
-	if evs[0]["stage"] != "01" {
-		t.Errorf("该打回 01（阶段列应显示 01），实际 %v", evs[0]["stage"])
+	// stage 是名字：前台那行「阶段」显示的就是名字，卡点写编号会让同一段在两处
+	// 显示成两个样子，而消解是按这个值认人的。
+	if evs[0]["stage"] != "需求澄清" {
+		t.Errorf("该打回「需求澄清」，实际 %v", evs[0]["stage"])
 	}
 }
 
@@ -260,14 +262,23 @@ func TestStageMarkerIsDeterministic(t *testing.T) {
 	}
 
 	evs := readEvents(t, eventsLog)
-	if len(evs) != 1 {
-		t.Fatalf("应恰好留一条事件，实际 %d 条", len(evs))
+	if len(evs) != 2 {
+		t.Fatalf("该留两条事件（进入这一段 + 这一段被接受），实际 %d 条: %v", len(evs), evs)
 	}
-	if evs[0]["type"] != "progress" {
-		t.Errorf("阶段标记该用黑名单类型，实际 %v", evs[0]["type"])
+	for _, e := range evs {
+		if e["type"] != "progress" {
+			t.Errorf("两条都该用黑名单类型，实际 %v", e["type"])
+		}
+		if e["stage"] != "需求澄清" {
+			t.Errorf("都该带阶段名，实际 %v", e["stage"])
+		}
 	}
-	if evs[0]["stage"] != "需求澄清" {
-		t.Errorf("阶段标记该带阶段名，实际 %v", evs[0]["stage"])
+	// 只有后一条是"被接受"——卡点靠它消解，进入那一条不算。
+	if evs[0]["outcome"] != nil {
+		t.Errorf("「进入阶段」不该带 outcome，实际 %v", evs[0]["outcome"])
+	}
+	if evs[1]["outcome"] != "accepted" {
+		t.Errorf("「交付通过出口条件」该标 accepted，实际 %v", evs[1]["outcome"])
 	}
 }
 

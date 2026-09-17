@@ -339,11 +339,29 @@ func isEmpty(v any) bool {
 }
 
 // Rejection 是一次驳回：谁把谁的活打回去了，因为哪几条。
+//
+// 名字和编号都留着：编号是链路上的位置（判定、回退点要它），名字是给前台读的
+// （"卡在本地开发"而不是"卡在 03"）。前台那行「阶段」显示的是名字，
+// 卡点里却写编号，读的人就得自己去对一张表。
 type Rejection struct {
-	From    string   `json:"from"`    // 打回给谁（上游阶段）
-	By      string   `json:"by"`      // 谁打回的
-	Item    string   `json:"item"`    // 哪个需求
-	Reasons []string `json:"reasons"` // 逐条不通过的原因
+	From     string   `json:"from"`      // 打回给谁（上游阶段号）
+	FromName string   `json:"from_name"` // 那一段叫什么
+	By       string   `json:"by"`        // 谁打回的（阶段号）
+	ByName   string   `json:"by_name"`   // 那一段叫什么
+	Item     string   `json:"item"`      // 哪个需求
+	Reasons  []string `json:"reasons"`   // 逐条不通过的原因
+}
+
+// label 是这一段的显示名：有名字用名字，没有就退回编号（判定不依赖名字）。
+func (r Rejection) label() string { return pick(r.FromName, r.From) }
+
+func (r Rejection) byLabel() string { return pick(r.ByName, r.By) }
+
+func pick(name, id string) string {
+	if name != "" {
+		return name
+	}
+	return id
 }
 
 func reasons(vs []Violation) []string {
@@ -369,7 +387,7 @@ func (s Stage) target(c Condition) string {
 //
 // 组按阶段号升序，不按驳回产生的先后：这一份要经投影摆到前台，也要被驱动整条链路的
 // 一层拿去算回退点，两种用途要的都是链路上的顺序，不是内部遍历的顺序。
-func Reject(stage Stage, item string, vs []Violation) []Rejection {
+func Reject(stages []Stage, stage Stage, item string, vs []Violation) []Rejection {
 	grouped := map[string][]Violation{}
 	for _, v := range vs {
 		t := stage.target(v.Cond)
@@ -384,7 +402,9 @@ func Reject(stage Stage, item string, vs []Violation) []Rejection {
 	out := make([]Rejection, 0, len(order))
 	for _, t := range order {
 		out = append(out, Rejection{
-			From: t, By: stage.ID, Item: item, Reasons: reasons(grouped[t]),
+			From: t, FromName: nameOf(stages, t),
+			By: stage.ID, ByName: stage.Name,
+			Item: item, Reasons: reasons(grouped[t]),
 		})
 	}
 	return out
@@ -393,7 +413,18 @@ func Reject(stage Stage, item string, vs []Violation) []Rejection {
 // SelfReject 是**出口条件**不通过：这份交付达不到下游的门槛，退回本阶段重做。
 // 它不打回上游——上游没错，是这一段自己的活没干完。
 func SelfReject(stage Stage, item string, vs []Violation) Rejection {
-	return Rejection{From: stage.ID, By: stage.ID, Item: item, Reasons: reasons(vs)}
+	return Rejection{
+		From: stage.ID, FromName: stage.Name,
+		By: stage.ID, ByName: stage.Name,
+		Item: item, Reasons: reasons(vs),
+	}
+}
+
+func nameOf(stages []Stage, id string) string {
+	if s, ok := ByID(stages, id); ok {
+		return s.Name
+	}
+	return ""
 }
 
 // Event 把驳回变成一条后台事件，类型 blocker。
@@ -402,15 +433,18 @@ func SelfReject(stage Stage, item string, vs []Violation) Rejection {
 // 是"卡在哪、因为哪几条"——看不到后台来回打了几轮、谁跟谁有分歧。
 func (r Rejection) Event() map[string]any {
 	// From == By 是出口不通过的自己退自己，措辞不能写成"被自己打回"。
-	summary := fmt.Sprintf("阶段 %s 的交付被 %s 打回（%d 条不通过）", r.From, r.By, len(r.Reasons))
+	// 名字之间不留空格：空格原本是「阶段 」这个前缀之后的断句，前缀去掉了，
+	// 留着就成了"本地开发 的交付被 部署验证 打回"——纯中文词中间多出的空档。
+	summary := fmt.Sprintf("%s的交付被%s打回（%d 条不通过）", r.label(), r.byLabel(), len(r.Reasons))
 	evidence := fmt.Sprintf("pipeline: 阶段 %s 入口判定，需求 %q", r.By, r.Item)
 	if r.From == r.By {
-		summary = fmt.Sprintf("阶段 %s 的交付未达出口条件（%d 条）", r.From, len(r.Reasons))
+		summary = fmt.Sprintf("%s的交付未达出口条件（%d 条）", r.label(), len(r.Reasons))
 		evidence = fmt.Sprintf("pipeline: 阶段 %s 出口判定，需求 %q", r.By, r.Item)
 	}
+	// stage 写名字：卡点要能跟别处的「阶段：<名字>」对上，同一段才认得出来是同一段。
 	return map[string]any{
 		"type":      "blocker",
-		"stage":     r.From,
+		"stage":     r.label(),
 		"summary":   summary,
 		"on":        strings.Join(r.Reasons, "；"),
 		"confirmed": true,

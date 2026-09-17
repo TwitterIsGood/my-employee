@@ -285,7 +285,7 @@ func TestRejectionGoesBackAndDownstreamIsRedone(t *testing.T) {
 			targets = append(targets, e["stage"].(string))
 		}
 	}
-	if strings.Join(targets, ",") != "01,02" {
+	if strings.Join(targets, ",") != "澄清,方案" {
 		t.Errorf("缺的东西该分别打回 01 与 02，实际 %v", targets)
 	}
 

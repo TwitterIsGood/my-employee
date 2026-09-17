@@ -52,6 +52,7 @@ type Result struct {
 	Kept        int
 	Blacklist   int
 	Unconfirmed int
+	Resolved    int // 因为那一段后来被接受了，已从「卡点 / 需要你决定」里撤下来的条数
 }
 
 // Parse 读 JSONL。任何一行不是合法 JSON 都直接报错，不静默跳过。
@@ -128,6 +129,7 @@ func classify(ev map[string]any, lineno int) (outcome, error) {
 func Build(events []map[string]any) (Result, error) {
 	res := Result{Total: len(events)}
 	var kept []map[string]any
+	var keptAt []int
 
 	for i, ev := range events {
 		lineno := i + 1
@@ -147,12 +149,51 @@ func Build(events []map[string]any) (Result, error) {
 			return res, fmt.Errorf("第 %d 条缺 summary——前台需要一句人话，不是字段堆", lineno)
 		}
 		kept = append(kept, ev)
+		keptAt = append(keptAt, i)
 	}
 
-	res.Kept = len(kept)
-	res.Text = render(kept, lastStage(events), lastConfirmed(kept))
+	live := resolve(kept, keptAt, events, &res)
+	res.Kept = len(live)
+	res.Text = render(live, lastStage(events), lastConfirmed(live))
 	return res, nil
 }
+
+// resolve 撤下已经被解决的「卡点」与「需要你决定」。
+//
+// 这两类记的是**某一段当时的处境**，不是历史事实。一段被打回过、后来又补交通过，
+// 那条卡点就该跟着消；一个问题被答过、那一段接着往下走了，那条"需要你决定"
+// 就不该再摆在需求方面前——同一件事问两遍比不问还坏。
+//
+// 消解的依据是同一个 stage 上有一条更晚的 accepted：一段的交付被接受了，
+// 它之前关于这一段的处境就都过去了。没有这条事件，前台会在写着
+// "全部阶段已完成"的同时，把几小时前的卡点继续挂在墙上。
+func resolve(kept []map[string]any, keptAt []int, events []map[string]any, res *Result) []map[string]any {
+	accepted := map[string]int{}
+	for i, ev := range events {
+		if str(ev["outcome"]) == "accepted" {
+			accepted[str(ev["stage"])] = i
+		}
+	}
+	if len(accepted) == 0 {
+		return kept
+	}
+
+	live := make([]map[string]any, 0, len(kept))
+	for j, ev := range kept {
+		if isSituational(str(ev["type"])) {
+			if at, ok := accepted[str(ev["stage"])]; ok && at > keptAt[j] {
+				res.Resolved++
+				continue
+			}
+		}
+		live = append(live, ev)
+	}
+	return live
+}
+
+// isSituational 是"这一段现在的处境"类的事件：过去了就该撤。
+// 已确认的失败/变更/观测是**发生过的事**，撤不掉，也不该撤。
+func isSituational(t string) bool { return t == "blocker" || t == "decision_needed" }
 
 func render(kept []map[string]any, stage, last string) string {
 	var b strings.Builder
