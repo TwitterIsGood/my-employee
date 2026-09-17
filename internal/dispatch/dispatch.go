@@ -24,6 +24,7 @@ import (
 
 	"github.com/TwitterIsGood/my-employee/internal/events"
 	"github.com/TwitterIsGood/my-employee/internal/pipeline"
+	"github.com/TwitterIsGood/my-employee/internal/projection"
 )
 
 // ErrRejectedUpstream 上游的交付不够开工，本阶段一次都没启动。
@@ -236,7 +237,23 @@ func (r Runner) Run(ctx context.Context, id string) error {
 					Rejections: []pipeline.Rejection{rej},
 				}
 			}
-			return r.accept(st)
+
+			// 先把要发的事实验通再接受：验不过就还是一次"没交好"，走同一条
+			// 带原因重跑的路。接受之后再验，会把一份没交好的交付记成已接受。
+			facts, vs := publishFacts(st, a)
+			if len(vs) > 0 {
+				last = vs
+				r.retry(st, attempt, last)
+				continue
+			}
+
+			// 接受的记录写在事实**之前**：投影是拿"这一段后来被接受了"去撤卡点、
+			// 撤待决策的。事实排在接受之后，才不会刚发出去就被自己撤掉——
+			// 它记的不是"某一段当时的处境"，是"这件事发生过"。
+			if err := r.accept(st); err != nil {
+				return err
+			}
+			return r.emitFacts(facts)
 		}
 
 		// 出口没过，但交付物里写着"我在等需求方拍板"——那是在等人，不是在失败。
@@ -473,6 +490,166 @@ func (r Runner) wakeFailed(st pipeline.Stage, err error, expired bool) error {
 		"confirmed": true,
 		"evidence":  fmt.Sprintf("dispatch: 阶段 %s 唤醒失败", st.ID),
 	})
+}
+
+// emitFacts 逐条写出去。一条写不进去就整段不成——不能发一半，
+// 前台读到半份事实和读到零份一样没法用。
+func (r Runner) emitFacts(facts []map[string]any) error {
+	for _, ev := range facts {
+		if err := r.write(ev); err != nil {
+			return err
+		}
+	}
+	if n := len(facts); n > 0 {
+		r.logf("发到前台 %d 条：%s\n", n, textOf(facts[0], "summary"))
+	}
+	return nil
+}
+
+// publishKeys 是"事件里该叫什么"到"交付物里怎么写的"的翻译表。
+//
+// 交付物通篇用中文（改了哪些文件、量到了什么），事件用投影白名单的键。
+// 中间这层翻译住在 harness 里，Agent 因此不必知道投影的模式——
+// 它只要照本段的 spec 写，剩下的映射是 harness 的事。
+//
+// 键取的是**投影白名单的键**（不是中文），因为校验要按白名单逐条要：
+// 白名单说要 `scope`，这里就得说得出 `scope` 取自交付物的哪一项。
+// 两张表对不上就当场退回，不会出现"发了一条投影认不出来的东西"。
+var publishKeys = map[string]map[string]string{
+	"change":          {"scope": "影响面"},
+	"observation":     {"metric": "指标", "window": "窗口", "value": "数值"},
+	"failure":         {"where": "位置", "cause": "原因"},
+	"decision_needed": {}, // options 由「选项」拼出来，和 pauseItems 同一套形状
+}
+
+// publishFact 一条要进前台的记录，交付物里写的样子。
+const (
+	factSummary  = "一句话"
+	factEvidence = "证据"
+	factOptions  = "选项"
+	factChoice   = "选项"
+	factCost     = "代价"
+)
+
+// publishable 看本段能不能发这一条。
+//
+// blocker 被挡在外面：卡点是**链路现在停着**这件事，那是派活那层的判断——
+// 它知道链路有没有停，交付物不知道。一段的交付刚被接受，就不可能同时是"停着的"。
+func publishable(typ string) bool {
+	if typ == "blocker" {
+		return false
+	}
+	_, ok := projection.Types()[typ]
+	return ok
+}
+
+// publishFacts 校验并翻译交付物里声明的事实。返回的每条都已经是可以直接写的记录。
+//
+// 校验先于发送，而且**不走静默丢弃那条路**：这个字段是唯一一条通往前台的路，
+// 写坏了就必须当场退回去重做。静默地什么都不发正是这个缺陷本身——
+// 白名单承诺了两栏，harness 一份都没发出去，从头到尾没有任何一处报错。
+//
+// 字段**缺省也算没过**。缺省不等于"本段没有可报的"，它等于"判不出来"：
+// 真的没有可报的，就写一个空数组。这和投影那条 `confirmed` 的规则是同一个道理。
+func publishFacts(st pipeline.Stage, a pipeline.Artifact) ([]map[string]any, []pipeline.Violation) {
+	// 没写 publish 的阶段本来就没打算往前台报东西，一条都不发不是漏。
+	if st.Publish == "" {
+		return nil, nil
+	}
+
+	violate := func(why string) []pipeline.Violation {
+		return []pipeline.Violation{{
+			Stage: st.ID,
+			Cond:  pipeline.Condition{Field: st.Publish},
+			Why:   why,
+		}}
+	}
+
+	raw, present := a[st.Publish]
+	if !present {
+		return nil, violate(fmt.Sprintf("声明了 publish=%s，交付物里却没有这个字段——"+
+			"没有可报的就写一个空数组，缺省判不出来", st.Publish))
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, violate("发不出去：" + err.Error())
+	}
+	var facts []map[string]any
+	if err := json.Unmarshal(b, &facts); err != nil {
+		return nil, violate(fmt.Sprintf("%s 该是一个数组，每项形如 {\"类型\":…,\"一句话\":…}", st.Publish))
+	}
+
+	allowed := projection.Types()
+	out := make([]map[string]any, 0, len(facts))
+	for i, f := range facts {
+		at := fmt.Sprintf("%s[%d]", st.Publish, i)
+
+		typ := textOf(f, "类型")
+		if !publishable(typ) {
+			return nil, violate(fmt.Sprintf("%s：类型 %q 不在投影白名单里（blocker 也不许由交付物发）", at, typ))
+		}
+		summary := textOf(f, factSummary)
+		if strings.TrimSpace(summary) == "" {
+			return nil, violate(fmt.Sprintf("%s：缺「%s」——前台要一句人话，不是字段堆", at, factSummary))
+		}
+
+		ev := map[string]any{
+			"type":     typ,
+			"stage":    st.Name,
+			"summary":  summary,
+			"evidence": fmt.Sprintf("阶段 %s 交付物 %s", st.ID, at),
+			// 确认这件事由 harness 做：这份交付通过了出口条件，它声明的事实才算数。
+			"confirmed": true,
+		}
+		if e := textOf(f, factEvidence); e != "" {
+			ev["evidence"] = e
+		}
+		for _, key := range allowed[typ] {
+			if key == "options" {
+				opts, ok := publishOptions(f)
+				if !ok {
+					return nil, violate(fmt.Sprintf("%s：需要需求方拍板就得给出至少两个选项，每个都带代价", at))
+				}
+				ev["options"] = opts
+				continue
+			}
+			v := textOf(f, publishKeys[typ][key])
+			if strings.TrimSpace(v) == "" {
+				return nil, violate(fmt.Sprintf("%s：类型 %s 必须带「%s」", at, typ, key))
+			}
+			ev[key] = v
+		}
+		out = append(out, ev)
+	}
+	return out, nil
+}
+
+// publishOptions 拼出投影要的 options。**必须和 pauseItems 同形（[]any 而不是 []string）**：
+// 投影器是拿 `ev["options"].([]any)` 数条数的，[]string 断不过去，会被判成 0 个选项——
+// 一条选项齐全的 decision_needed 到那儿就成了"后台的纠结原样倒给需求方"。
+func publishOptions(f map[string]any) ([]any, bool) {
+	raw, ok := f[factOptions].([]any)
+	if !ok || len(raw) < 2 {
+		return nil, false
+	}
+	out := make([]any, 0, len(raw))
+	for _, o := range raw {
+		m, ok := o.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		choice, cost := textOf(m, factChoice), textOf(m, factCost)
+		if strings.TrimSpace(choice) == "" || strings.TrimSpace(cost) == "" {
+			return nil, false
+		}
+		out = append(out, choice+"："+cost)
+	}
+	return out, true
+}
+
+func textOf(m map[string]any, key string) string {
+	s, _ := m[key].(string)
+	return s
 }
 
 // targets 把一次入口判定里的打回目标去重并排序。顺序按阶段号，不按驳回产生的

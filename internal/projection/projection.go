@@ -27,6 +27,22 @@ var allowedRequired = map[string][]string{
 	"decision_needed": {"options"},
 }
 
+// Types 把白名单连同"该带哪些字段"交出去，给**发事件的**那一侧校验自己发的东西。
+//
+// 导出这个不是为了方便，是为了堵掉一类错：白名单是一种承诺，承诺了却没人发，
+// 前台就在假装有这么两栏。一趟真实的七段链路跑完，投影里有「已发生的变更」
+// 和「观测到的数字」两个标题，而 03 改的 9 个文件、05 量出的「门槛低 6 倍」
+// 一条都进不来——因为 harness 里没有任何代码路径发 change / observation / failure。
+//
+// 承诺和兑现放在同一张表上，脱节才是编译得过、跑得通、只是没人发现的那种错。
+func Types() map[string][]string {
+	out := make(map[string][]string, len(allowedRequired))
+	for t, keys := range allowedRequired {
+		out[t] = append([]string(nil), keys...)
+	}
+	return out
+}
+
 // 黑名单：一律不出。判定标准是确定性，不是好坏。
 var forbidden = map[string]bool{
 	"retry": true, "hypothesis": true, "debate": true,
@@ -43,6 +59,22 @@ var headings = []struct{ typ, title string }{
 	{"failure", "已确认的失败"},
 	{"change", "已发生的变更"},
 	{"observation", "观测到的数字"},
+}
+
+// labels 是字段名给前台看的样子。**事件里是英文键，前台看到的是中文**——
+// 前台是需求方在读，`metric: …` 这种是给机器看的。
+// 这张表一直没被走过：change / observation 两类事件在修好之前根本没人发，
+// 于是 render 里那句 str(e[key]) 直接印出了英文键，也没人发现。
+var labels = map[string]string{
+	"scope": "影响面", "metric": "指标", "window": "窗口", "value": "数值",
+	"where": "位置", "cause": "原因", "on": "卡在",
+}
+
+func label(key string) string {
+	if s, ok := labels[key]; ok {
+		return s
+	}
+	return key
 }
 
 // Result 是投影的结果，带上统计供 ops 观察。
@@ -234,7 +266,7 @@ func render(kept []map[string]any, stage, last string) string {
 						blk.WriteString(fmt.Sprintf("  %d. %s\n", i+1, str(o)))
 					}
 				} else {
-					blk.WriteString("  - " + key + ": " + str(e[key]) + "\n")
+					blk.WriteString("  - " + label(key) + ": " + str(e[key]) + "\n")
 				}
 			}
 			blk.WriteString("  - 证据: " + str(e["evidence"]) + "\n")

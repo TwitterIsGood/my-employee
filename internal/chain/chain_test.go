@@ -572,7 +572,12 @@ func TestRealTreeWalks(t *testing.T) {
 		// 03 出口：diff / scope / 失败记录(present)
 		"变更卡": `{
 			"diff":"新增 migrations/0042_daily_login_stats.sql 与 internal/stats/daily.go",
-			"scope":"只新增表与只读接口，不改登录链路","失败记录":[]}`,
+			"scope":"只新增表与只读接口，不改登录链路","失败记录":[],
+			"前台事实":[{"类型":"change","一句话":"新增聚合表与只读接口，登录链路一字未动",
+				"影响面":"migrations/0042_daily_login_stats.sql、internal/stats/daily.go"},
+				{"类型":"decision_needed","一句话":"聚合表要不要保留历史明细？",
+					"选项":[{"选项":"只留按天汇总","代价":"查不到单个用户的登录轨迹"},
+						{"选项":"同时留明细表","代价":"多一份存储与一次写入放大"}]}]}`,
 		// 04 出口：测试命令 / 退出码 / 未覆盖场景(present)；(触及数据路径=false 时不要求日志)
 		"测试报告": `{
 			"测试命令":"go test ./internal/stats/... && ./scripts/compare-aggregate.sh",
@@ -640,6 +645,11 @@ func card(t *testing.T, body string) map[string]any {
 	var m map[string]any
 	if err := json.Unmarshal([]byte(body), &m); err != nil {
 		t.Fatalf("样本不是合法 JSON: %v", err)
+	}
+	// 声明了 publish 的阶段必须交出那个字段，缺省算没过。样本里没写就是"本段没有
+	// 可报的"——按规范该显式写一个空数组，这里替样本补上，免得每张卡都写一行 `[]`。
+	if _, ok := m["前台事实"]; !ok {
+		m["前台事实"] = []any{}
 	}
 	return m
 }

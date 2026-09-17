@@ -141,3 +141,24 @@ func TestTemplateHasFullContract(t *testing.T) {
 		}
 	}
 }
+
+// 「报给前台」这件事，散文和契约必须同时有，或者同时没有。
+//
+// 只写散文不写 `publish`，交付物里那条就发不出去；只写 `publish` 不写散文，
+// 写交付物的人不知道那个字段该长什么样。两边缺一边，机制就静默失效——
+// 而静默失效正是这个字段存在的理由（见 `internal/dispatch` 那条白名单对账测试）。
+func TestReportsToFrontAreDeclaredInBothProseAndContract(t *testing.T) {
+	const heading = "## 报给前台"
+	for _, p := range numberedStages(t) {
+		doc := read(t, p)
+		name := filepath.Base(p)
+		prose := strings.Contains(doc, heading)
+		declared := strings.Contains(doc, `"publish"`)
+		switch {
+		case prose && !declared:
+			t.Errorf("%s 写了「报给前台」小节，契约里却没有 publish——那些事实一条都出不去", name)
+		case declared && !prose:
+			t.Errorf("%s 声明了 publish，却没有「报给前台」小节——写交付物的人不知道那个字段长什么样", name)
+		}
+	}
+}

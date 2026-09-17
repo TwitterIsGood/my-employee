@@ -14,6 +14,7 @@ import (
 
 	"github.com/TwitterIsGood/my-employee/internal/events"
 	"github.com/TwitterIsGood/my-employee/internal/pipeline"
+	"github.com/TwitterIsGood/my-employee/internal/projection"
 )
 
 // 这一层守的是**屏障**：上游没交齐，下游一次都不许启动；
@@ -248,6 +249,7 @@ func TestVerdictPassAdvancesNormally(t *testing.T) {
 		"结论":    "通过",
 		"证伪尝试":  []map[string]any{{"怎么试的": "并发登录同一用户", "结果": "计数无不一致"}},
 		"未覆盖范围": []string{"超长 user_id"},
+		"前台事实":  []any{},
 	})
 
 	err := Runner{
@@ -367,6 +369,237 @@ func TestATimedOutWakeIsKilledWithItsChildren(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Errorf("超时收走了 sh，却把子进程 %d 留在了机器上", pid)
+}
+
+// 白名单是一种承诺：承诺了什么，就得有谁去发。
+//
+// 这条是实测出来的。一趟七段链路跑完，投影里有「已发生的变更」「观测到的数字」
+// 两个标题，而 03 改的 9 个文件、05 量出的「门槛比原先估的低 6 倍」一条都进不来——
+// harness 里没有任何代码路径发 change / observation / failure。
+// 承诺和兑现之间没有第二个人对账，所以它们能一边承诺、一边什么都不发，
+// 而且编译得过、跑得通、测试全绿，只是没人发现。
+func TestEveryWhitelistedTypeIsReachable(t *testing.T) {
+	// 这两类由 harness 自己发，不由交付物发：卡点来自判定与驳回，待决策来自 pause_on。
+	byHarness := map[string]bool{"blocker": true, "decision_needed": true}
+
+	for typ := range projection.Types() {
+		if byHarness[typ] {
+			continue
+		}
+		if _, ok := publishKeys[typ]; !ok {
+			t.Errorf("白名单里的 %q 谁都不发：交付物发不出它（publishKeys 里没有），"+
+				"harness 也不发它。承诺了却没人发，前台就在假装有这一栏", typ)
+		}
+	}
+	// 反方向也要对：能发的类型必须在白名单里，否则是发了一条投影认不出来的东西，
+	// 那时投影会直接报错——而错的是发射端，不是投影。
+	for typ := range publishKeys {
+		if _, ok := projection.Types()[typ]; !ok {
+			t.Errorf("publishKeys 会发 %q，而投影白名单里没有它", typ)
+		}
+	}
+}
+
+// 报给前台这件事，端到端要看得见：交付物里声明的事实，最后要落到投影上。
+//
+// 只测"harness 写了一条 type=change 的事件"是不够的——那正是缺陷 C 的形状：
+// 事件类型凑齐了，前台还是一个字没有。所以这条一路比到**前台的正文**。
+func TestPublishedFactsReachTheFront(t *testing.T) {
+	dir := t.TempDir()
+	eventsLog := filepath.Join(dir, "events.jsonl")
+
+	_, w := writer(dir, "变更卡", map[string]any{
+		"diff":  "9 files changed",
+		"scope": "internal/api、internal/logstore 等 9 个文件",
+		"失败记录":  []any{},
+		"前台事实": []any{
+			map[string]any{
+				"类型": "change", "一句话": "改了 9 个文件",
+				"影响面": "internal/api/api.go、internal/logstore/store.go 等 9 个文件",
+			},
+			map[string]any{
+				"类型": "observation", "一句话": "读路径比改前慢一个量级",
+				"指标": "/api/daily 单发延迟", "窗口": "100 万行数据", "数值": "1.35s",
+			},
+			map[string]any{
+				"类型": "decision_needed", "一句话": "写入端限长的阈值定多少？",
+				"选项": []any{
+					map[string]any{"选项": "按现在的 256 字节", "代价": "极长 user_id 被拒"},
+					map[string]any{"选项": "放宽到 1 MiB", "代价": "单行可能撑爆响应"},
+				},
+			},
+		},
+	})
+	write(t, dir, "需求定义卡", map[string]any{"验收标准": "看板 1 秒内出数"})
+	write(t, dir, "方案卡", map[string]any{
+		"做法": "换读路径", "影响面": "internal", "未标注推断": []any{},
+	})
+
+	err := Runner{
+		Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+		Events: eventsLog, Budget: 3, Item: "活跃度看板", Worker: w,
+	}.Run(context.Background(), "03")
+	if err != nil {
+		t.Fatalf("这一段该过关: %v", err)
+	}
+
+	evs, err := projection.Parse(mustRead(t, eventsLog))
+	if err != nil {
+		t.Fatalf("事件日志读不了: %v", err)
+	}
+	built, err := projection.Build(evs)
+	if err != nil {
+		t.Fatalf("harness 发出去的东西投影该认: %v", err)
+	}
+	front := built.Text
+
+	for _, want := range []string{
+		"改了 9 个文件",
+		"读路径比改前慢一个量级",
+		"1.35s",        // observation 的三个键都得在
+		"写入端限长的阈值定多少？", // 待决策要真的到前台
+		"按现在的 256 字节",
+	} {
+		if !strings.Contains(front, want) {
+			t.Errorf("前台该看到 %q，实际全文:\n%s", want, front)
+		}
+	}
+	// 「上一个已确认的完成点」读的是最后一条 change。没有 change 它就永远是「无」——
+	// 七个阶段真跑下来，那行主标题写着「无」，比不报还难看。
+	if strings.Contains(front, "上一个已确认的完成点：无") {
+		t.Errorf("有 change 就该填上完成点，实际全文:\n%s", front)
+	}
+}
+
+// 发出去的事件，形状必须和投影器读它的方式一致。
+//
+// 这条曾经差过一次：publishOptions 返回 []string，而投影器数选项条数用的是
+// `ev["options"].([]any)`——[]string 断不过去，一条选项齐备的待决策在那儿被
+// 判成"0 个选项"，整次投影直接报错。
+//
+// 这个错**在落盘那条路上看不见**：JSON 一来一回会把 []string 重新解成 []any，
+// 所以端到端测试照样绿。只有不经磁盘、直接拿内存里那张 map 去投影的人会中招。
+// 所以要单独钉一条：按投影器的读法读，而不是按我们自己的写法过一遍。
+func TestPublishedFactsHaveTheShapeProjectionReads(t *testing.T) {
+	st := pipeline.Stage{ID: "03", Name: "本地开发", Publish: "前台事实"}
+	a := pipeline.Artifact{"前台事实": []any{
+		map[string]any{
+			"类型": "decision_needed", "一句话": "阈值定多少？",
+			"选项": []any{
+				map[string]any{"选项": "256 字节", "代价": "极长 user_id 被拒"},
+				map[string]any{"选项": "1 MiB", "代价": "单行可能撑爆响应"},
+			},
+		},
+	}}
+
+	facts, vs := publishFacts(st, a)
+	if len(vs) > 0 {
+		t.Fatalf("该发得出去: %s", vs[0].Why)
+	}
+	opts, ok := facts[0]["options"].([]any)
+	if !ok {
+		t.Fatalf("options 是 %T，投影器只认 []any——落盘再读回来才发现不了这个错",
+			facts[0]["options"])
+	}
+	if len(opts) != 2 {
+		t.Errorf("选项数不对: %d", len(opts))
+	}
+	// 最后按投影器的方式整个走一遍，内存里这一份能不能过它的校验。
+	if _, err := projection.Build([]map[string]any{facts[0]}); err != nil {
+		t.Errorf("内存里发出的事件投影器认不了: %v", err)
+	}
+}
+
+// 声明了 publish 却不交那个字段，是**没交够**，不是"没什么可报的"。
+//
+// 缺省不等于没有——它等于判不出来，和投影那条 `confirmed` 是同一个道理。
+// 真没有可报的就写一个空数组，那才是一个明确的表态。
+func TestMissingPublishedFieldIsNotAccepted(t *testing.T) {
+	dir := t.TempDir()
+	eventsLog := filepath.Join(dir, "events.jsonl")
+
+	card := map[string]any{
+		"diff": "9 files changed", "scope": "internal",
+		"失败记录": []any{},
+	}
+	calls, w := writer(dir, "变更卡", card, card)
+	write(t, dir, "需求定义卡", map[string]any{"验收标准": "看板 1 秒内出数"})
+	write(t, dir, "方案卡", map[string]any{
+		"做法": "换读路径", "影响面": "internal", "未标注推断": []any{},
+	})
+
+	err := Runner{
+		Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+		Events: eventsLog, Budget: 2, Item: "看板", Worker: w,
+	}.Run(context.Background(), "03")
+
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("缺字段不该被当成已接受，实际 %v", err)
+	}
+	if *calls != 2 {
+		t.Errorf("该带着原因重跑到预算用尽，实际唤醒 %d 次", *calls)
+	}
+	// 中途那两次没过是**过程**，只有预算用尽时那一条才该发到前台。
+	evs := blockers(t, eventsLog)
+	if len(evs) != 1 {
+		t.Fatalf("只该有一条升级卡点，实际 %v", evs)
+	}
+	if !strings.Contains(str(evs[0]["summary"]), "连续 2 次未达出口条件") {
+		t.Errorf("那条该是升级卡点，实际 %v", evs[0]["summary"])
+	}
+	if !strings.Contains(str(evs[0]["on"]), "前台事实") {
+		t.Errorf("升级时要带上卡在哪一条，实际 %v", evs[0]["on"])
+	}
+}
+
+// 发出去的东西必须当场校验：类型不对、该带的字段没带、想自己发卡点，
+// 都在这里被挡下。挡不住的话，前台会收到投影认不出来的记录——
+// 那时投影直接报错退出，锅看起来是投影的，其实是发射端发了不该发的。
+func TestBadPublishedFactsAreRejectedLoudly(t *testing.T) {
+	cases := []struct {
+		why  string
+		fact map[string]any
+	}{
+		{"类型不在白名单里", map[string]any{
+			"类型": "progress", "一句话": "进展顺利"}},
+		{"blocker 不许由交付物发", map[string]any{
+			"类型": "blocker", "一句话": "卡住了", "卡在": "编译"}},
+		{"缺一句话", map[string]any{
+			"类型": "change", "影响面": "internal"}},
+		{"change 缺影响面", map[string]any{
+			"类型": "change", "一句话": "改了 9 个文件"}},
+		{"observation 缺数值", map[string]any{
+			"类型": "observation", "一句话": "慢了", "指标": "p99", "窗口": "10 万行"}},
+		{"decision_needed 只有一个选项", map[string]any{
+			"类型": "decision_needed", "一句话": "选哪个", "选项": []any{
+				map[string]any{"选项": "甲", "代价": "贵"}}}},
+		{"选项没写代价", map[string]any{
+			"类型": "decision_needed", "一句话": "选哪个", "选项": []any{
+				map[string]any{"选项": "甲"}, map[string]any{"选项": "乙"}}}},
+	}
+	for _, c := range cases {
+		st := pipeline.Stage{ID: "03", Name: "本地开发", Produces: "变更卡", Publish: "前台事实"}
+		a := pipeline.Artifact{"前台事实": []any{c.fact}}
+		facts, vs := publishFacts(st, a)
+		if len(vs) != 1 {
+			t.Errorf("%s：该被挡下，实际过了 %v", c.why, facts)
+			continue
+		}
+		if facts != nil {
+			t.Errorf("%s：挡下就不该同时发出去", c.why)
+		}
+	}
+}
+
+// 没声明 publish 的阶段一条都不发。这不是漏——没打算报的阶段本来就没打算报。
+func TestStageWithoutPublishPublishesNothing(t *testing.T) {
+	st := pipeline.Stage{ID: "01", Name: "需求澄清", Produces: "需求定义卡"}
+	facts, vs := publishFacts(st, pipeline.Artifact{"前台事实": []any{
+		map[string]any{"类型": "change", "一句话": "改了什么"},
+	}})
+	if len(facts) != 0 || len(vs) != 0 {
+		t.Errorf("没声明 publish 就不该发，实际 facts=%v vs=%v", facts, vs)
+	}
 }
 
 // 交付物没写出来 / 不是合法 JSON，也走同一条打回重跑的路，不能变成旁路。

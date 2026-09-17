@@ -110,6 +110,27 @@ func TestGoodEventPasses(t *testing.T) {
 	}
 }
 
+// 事件里是英文键，前台看到的是中文——读的人是需求方，不是读日志的人。
+//
+// 这条一直没被走过：change / observation 两类事件在"没人发"的那段时间里一条都没有，
+// render 里那句直接印 key，于是字段名原样漏到了前台（`metric: …`）。
+func TestFieldNamesAreRenderedInChinese(t *testing.T) {
+	res, err := Build([]map[string]any{
+		{"type": "change", "scope": "9 个文件", "confirmed": true,
+			"evidence": "git diff --stat", "summary": "改了 9 个文件"},
+		{"type": "observation", "metric": "延迟", "window": "100 万行", "value": "1.35s",
+			"confirmed": true, "evidence": "压测日志", "summary": "慢了一个量级"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"影响面: 9 个文件", "指标: 延迟", "窗口: 100 万行", "数值: 1.35s"} {
+		if !strings.Contains(res.Text, want) {
+			t.Errorf("前台该看到 %q，实际:\n%s", want, res.Text)
+		}
+	}
+}
+
 // —— 卡点是有生命周期的 ——
 //
 // 一段被打回过、后来又补交通过，那条卡点就该跟着消。不消的后果是真实跑出来的：
@@ -234,7 +255,7 @@ func TestNumberRendering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.Text, "value: 0\n") {
+	if !strings.Contains(res.Text, "数值: 0\n") {
 		t.Errorf("数字渲染不对:\n%s", res.Text)
 	}
 }
