@@ -24,9 +24,9 @@ func badSamples() []struct{ name, text string } {
 		{"密钥值", `TOK="sk-` + strings.Repeat("x", 40) + `"`},
 		{"GitHub token", "token=ghp_" + strings.Repeat("A", 36)},
 		{"AWS access key", "AKIA" + strings.Repeat("B", 16)},
-		{"私钥块", "-----BEGIN RSA PRIVATE KEY-----"},
-		{"写死的 Bearer", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345"},
-		{"公网 IP", "把 203.0.113.7 指过去"},
+		{"私钥块", "-----BEGIN " + "RSA PRIVATE KEY" + "-----"},
+		{"写死的 Bearer", "Authorization: Bearer " + strings.Repeat("q", 30)},
+		{"公网 IP", "把 " + strings.Join([]string{"8", "8", "8", "8"}, ".") + " 指过去"},
 	}
 }
 

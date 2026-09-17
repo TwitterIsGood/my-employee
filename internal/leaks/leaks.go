@@ -107,7 +107,7 @@ func Scan(file string, src []byte) []Finding {
 			}
 		}
 		for _, m := range reIPv4.FindAllString(line, -1) {
-			if loopback(m) || m == "0.0.0.0" || m == "255.255.255.255" {
+			if notInfra(m) {
 				continue
 			}
 			hit("IP 字面量", m)
@@ -123,7 +123,21 @@ func Scan(file string, src []byte) []Finding {
 	return out
 }
 
-func loopback(ip string) bool { return strings.HasPrefix(ip, "127.") }
+// notInfra 是"这个地址不可能是谁的机器"。
+//
+// 除了回环和全零/全一，还放行 RFC 5737 那三段**专门留出来写文档用**的地址——
+// 它们的全部用途就是出现在文档和测试里，对它们喊是纯噪音。
+func notInfra(ip string) bool {
+	if strings.HasPrefix(ip, "127.") || ip == "0.0.0.0" || ip == "255.255.255.255" {
+		return true
+	}
+	for _, p := range []string{"192.0.2.", "198.51.100.", "203.0.113."} {
+		if strings.HasPrefix(ip, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // looksLikeHost 只看结尾那个标签像不像 TLD。
 // `chain.json`、`main.go`、`os.Args`、`hooks.UserPromptSubmit` 到这儿就出去了——
