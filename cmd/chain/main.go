@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/TwitterIsGood/my-employee/internal/chain"
 	"github.com/TwitterIsGood/my-employee/internal/cli"
@@ -33,6 +34,9 @@ const usage = `chain —— 把一条需求走完 01→07（非 Agent）
   --events <path>     事件日志；空则不记
   --item <名字>       需求名
   --budget <n>        每段出口未过时的重跑上限（默认 3）
+  --wake-timeout <d>  一次唤醒的墙钟上限（默认 30m）。超了就掐掉、连同它拉起的
+                      子进程一起收走，并留一条卡点。撞南墙会升级给人，
+                      "叫不醒"不会——所以它得自己有个头
   --max-rework <n>    整条链的返工上限（默认 2）。超了就升级给人工指导者——
                       单段的 budget 管不住"03 改完 05 又打回"这种来回
   --worker-cmd <c>    唤醒命令，prompt 从 stdin 进（默认见下）
@@ -49,7 +53,8 @@ const usage = `chain —— 把一条需求走完 01→07（非 Agent）
 默认唤醒命令：
   claude -p --settings <settings> --dangerously-skip-permissions
 
-退出码：0 全程走完 / 1 撞南墙或某段预算用尽 / 2 用法或读取错误 / 3 停在等人答复。
+退出码：0 全程走完 / 1 撞南墙、某段预算用尽、或某段叫不醒 / 2 用法或读取错误 /
+3 停在等人答复。撞了断的这几种，断在哪都写在 chain.json 里，接着跑就是接着走。
 `
 
 func main() {
@@ -65,6 +70,7 @@ func exitCode(err error) int {
 		return 3 // 在等人，不是失败——答复回来接着走
 	case errors.Is(err, chain.ErrNotConverging),
 		errors.Is(err, dispatch.ErrRejectedUpstream),
+		errors.Is(err, dispatch.ErrWakeFailed),
 		errors.Is(err, dispatch.ErrBudgetExhausted):
 		return 1
 	}
@@ -86,6 +92,7 @@ func run(args []string) error {
 		item      = fs.String("item", "", "需求名")
 		budget    = fs.Int("budget", 3, "每段的重跑上限")
 		maxRework = fs.Int("max-rework", 2, "整条链的返工上限")
+		wakeTO    = fs.Duration("wake-timeout", 30*time.Minute, "一次唤醒的墙钟上限")
 		workerCmd = fs.String("worker-cmd", "", "唤醒命令")
 		settings  = fs.String("settings", "", "claude 的 --settings 文件")
 		work      = fs.String("work", "", "唤醒命令的工作目录")
@@ -140,18 +147,19 @@ func run(args []string) error {
 	}
 
 	return (&chain.Runner{
-		Stages:    stages,
-		SpecsDir:  *stagesDir,
-		Dir:       *dir,
-		Events:    *eventsLog,
-		Budget:    *budget,
-		MaxRework: *maxRework,
-		Worker:    def,
-		Workers:   workers,
-		Item:      *item,
-		Brief:     *brief,
-		Restart:   *restart,
-		Log:       os.Stdout,
+		Stages:      stages,
+		SpecsDir:    *stagesDir,
+		Dir:         *dir,
+		Events:      *eventsLog,
+		Budget:      *budget,
+		MaxRework:   *maxRework,
+		WakeTimeout: *wakeTO,
+		Worker:      def,
+		Workers:     workers,
+		Item:        *item,
+		Brief:       *brief,
+		Restart:     *restart,
+		Log:         os.Stdout,
 	}).Run(context.Background())
 }
 

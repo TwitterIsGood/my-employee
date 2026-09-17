@@ -27,6 +27,24 @@ type Condition struct {
 	Value any         `json:"value,omitempty"`
 }
 
+// VerdictRoute 把"本阶段的交付里判出了一个结论"翻译成"该打回给谁"。
+//
+// 有的阶段交出来的不是"行不行"，而是"这份变更本身有问题"——05 对抗式审查就是。
+// 它的出口条件**合法地允许** `结论 = 驳回`；可驳回不是一个终态：那份交付必须有地方可去。
+//
+// 少了这一段，05 会带着 `驳回` 通过自己的出口、被交给 06，而 06 的入口要求
+// `结论 = 通过`，于是 06 把 05 退回来、05 照证据不改结论、再退回来——一直撞到返工上限。
+// 这不是假设：真实跑一趟七段树时，05 与 06 就这么空转了四轮，一个字节都没往前挪。
+//
+// 触发条件复用 Condition，去向由交付物自己点名（`target_field`），
+// 理由也取自交付物（`reasons_field`）——这样前台读到的是审查者写的那句人话，
+// 而不是机器拼出来的字段名。
+type VerdictRoute struct {
+	When         []Condition `json:"when"`
+	TargetField  string      `json:"target_field"`
+	ReasonsField string      `json:"reasons_field,omitempty"`
+}
+
 // Stage 是一个阶段的机器可读契约，附在对应的 spec 文件里。
 type Stage struct {
 	ID       string      `json:"id"`
@@ -38,6 +56,9 @@ type Stage struct {
 	// 入口条件来自不同上游时，各自该打回的地方不一样：06 的变更卡缺字段打回 03
 	// （05 复审），而审查记录的问题打回 05。这里按交付物名覆盖 RejectTo。
 	RejectUpstream map[string]string `json:"reject_upstream,omitempty"`
+	// Verdicts 是"出口过了、但这份交付本身判出该往回走"的去向。
+	// 与 RejectUpstream 的区别是触发点：那个管入口（上游没交够），这个管裁决（交够了，但结论是打回）。
+	Verdicts []VerdictRoute `json:"reject_on,omitempty"`
 	// PauseOn 指向交付物里的一个字段：它非空（且形如决策项）时，本阶段是在**等人**，
 	// 不是在失败。例：01 的口径定不下来，就该把取舍摆给需求方然后停住——
 	// 停住是一次正常的中断，不是撞南墙；重跑多少次都问不出需求方的答案。
@@ -307,6 +328,92 @@ func (s Stage) CheckExit(a Artifact) []Violation {
 	return vs
 }
 
+// Verdict 是一条命中的裁决路由：这份交付该退回给谁、附什么理由。
+type Verdict struct {
+	Target  string
+	Reasons []string
+}
+
+// Route 看这份交付里有没有"该退回上游"的裁决。没命中就照常往下走。
+//
+// 只在出口条件**过了之后**才有意义：出口没过是这一段自己的活没干完，
+// 走的是重做；出口过了却判出上游有问题，才是这里管的事。
+//
+// 命中但说不清退回给谁时**报错**，不是放行——一条说不清去向的驳回，
+// 和一条说不清前置的闸门是同一种东西：它会被静默跳过。
+func (s Stage) Route(a Artifact) (Verdict, bool, error) {
+	for _, r := range s.Verdicts {
+		fired, err := fires(r.When, a)
+		if err != nil {
+			return Verdict{}, false, fmt.Errorf("阶段 %s 的裁决条件判不了: %w", s.ID, err)
+		}
+		if !fired {
+			continue
+		}
+		target := strings.TrimSpace(str(a[r.TargetField]))
+		if target == "" {
+			return Verdict{}, false, fmt.Errorf(
+				"阶段 %s 判出这份交付该退回上游，但 %s 里没写退回给谁", s.ID, r.TargetField)
+		}
+		return Verdict{Target: target, Reasons: asReasons(a[r.ReasonsField])}, true, nil
+	}
+	return Verdict{}, false, nil
+}
+
+// fires 判一组前置是否全部成立。前置字段缺失即报错：
+// 判不出来的时候说"不成立"，等于让一条闸门悄悄失效。
+func fires(when []Condition, a Artifact) (bool, error) {
+	for _, w := range when {
+		v, ok := a[w.Field]
+		if !ok {
+			return false, fmt.Errorf("前置字段 %s 缺失", w.Field)
+		}
+		if !holds(w, v) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// asReasons 把交付物里的理由字段收成一组。字符串算一条；
+// 没写就返回一条占位——前台的卡点必须说得出"因为什么"，空着等于没说。
+func asReasons(v any) []string {
+	switch t := v.(type) {
+	case nil:
+		return []string{"审查者未附具体理由"}
+	case string:
+		if strings.TrimSpace(t) == "" {
+			return []string{"审查者未附具体理由"}
+		}
+		return []string{t}
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, x := range t {
+			out = append(out, str(x))
+		}
+		if len(out) == 0 {
+			return []string{"审查者未附具体理由"}
+		}
+		return out
+	case []string:
+		if len(t) == 0 {
+			return []string{"审查者未附具体理由"}
+		}
+		return t
+	}
+	return []string{str(v)}
+}
+
+func str(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
+}
+
 // CheckEntry 判定入口条件：上游的交付物够不够我开工。
 // arts 的键是交付物名字（对应 Condition.From）。
 func (s Stage) CheckEntry(arts map[string]Artifact) []Violation {
@@ -350,6 +457,10 @@ type Rejection struct {
 	ByName   string   `json:"by_name"`   // 那一段叫什么
 	Item     string   `json:"item"`      // 哪个需求
 	Reasons  []string `json:"reasons"`   // 逐条不通过的原因
+	// Verdict 标出这条不是"上游没交够"，而是"交够了、但审出来有问题"。
+	// 措辞和证据行都要跟着变，不然前台读到的是"06 的入口判定"——
+	// 而 06 根本没参与这件事。
+	Verdict bool `json:"verdict,omitempty"`
 }
 
 // label 是这一段的显示名：有名字用名字，没有就退回编号（判定不依赖名字）。
@@ -420,6 +531,20 @@ func SelfReject(stage Stage, item string, vs []Violation) Rejection {
 	}
 }
 
+// RejectVerdict 依据**本阶段自己的裁决**产出驳回：出口过了，但这份交付
+// 审出来上游有问题，被退回给交付物点名的那一段（05 的 `驳回至`）。
+//
+// 和 Reject 的区别在证据上：Reject 是"上游没交够"，那是流水线判的；
+// 这条是"交够了、审出问题"，那是审查者判的，所以理由用审查者写的那句话，
+// 前台读到的才是"看板会被一个请求打坏"，而不是一串字段名。
+func RejectVerdict(stages []Stage, stage Stage, v Verdict, item string) Rejection {
+	return Rejection{
+		From: v.Target, FromName: nameOf(stages, v.Target),
+		By: stage.ID, ByName: stage.Name,
+		Item: item, Reasons: v.Reasons, Verdict: true,
+	}
+}
+
 func nameOf(stages []Stage, id string) string {
 	if s, ok := ByID(stages, id); ok {
 		return s.Name
@@ -437,7 +562,13 @@ func (r Rejection) Event() map[string]any {
 	// 留着就成了"本地开发 的交付被 部署验证 打回"——纯中文词中间多出的空档。
 	summary := fmt.Sprintf("%s的交付被%s打回（%d 条不通过）", r.label(), r.byLabel(), len(r.Reasons))
 	evidence := fmt.Sprintf("pipeline: 阶段 %s 入口判定，需求 %q", r.By, r.Item)
-	if r.From == r.By {
+	switch {
+	case r.Verdict:
+		// 出口过了、是这一段自己审出来的问题。写"入口判定"会把责任说错段：
+		// 上游交够了，是审出来的毛病。
+		summary = fmt.Sprintf("%s审出%s的交付有问题，退回（%d 条）", r.byLabel(), r.label(), len(r.Reasons))
+		evidence = fmt.Sprintf("pipeline: 阶段 %s 的裁决，需求 %q", r.By, r.Item)
+	case r.From == r.By:
 		summary = fmt.Sprintf("%s的交付未达出口条件（%d 条）", r.label(), len(r.Reasons))
 		evidence = fmt.Sprintf("pipeline: 阶段 %s 出口判定，需求 %q", r.By, r.Item)
 	}

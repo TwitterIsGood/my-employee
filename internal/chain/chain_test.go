@@ -80,6 +80,154 @@ func threeStages(t *testing.T, dir string) ([]pipeline.Stage, string) {
 	}, specsDir
 }
 
+// verdictStages 合成「开发 → 审查 → 部署」三段，把 验证B 撞上的那次死锁摆成反例。
+func verdictStages(t *testing.T, dir string) ([]pipeline.Stage, string) {
+	t.Helper()
+	specsDir := filepath.Join(dir, "standards")
+	if err := os.MkdirAll(specsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return []pipeline.Stage{
+		newStage(t, specsDir, `{"id":"01","name":"开发","produces":"卡一","entry":[],
+			"exit":[{"field":"A","check":"nonempty"}],"pause_on":"待决策"}`),
+		// 审查：出口只要求「结论是个二值」，判驳回不算自己没交够。
+		newStage(t, specsDir, `{"id":"02","name":"审查","produces":"卡二",
+			"entry":[{"from":"卡一","field":"A","check":"nonempty"}],
+			"exit":[{"field":"结论","check":"one_of","value":["通过","驳回"]}],
+			"reject_on":[{"when":[{"field":"结论","check":"equals","value":"驳回"}],
+				"target_field":"驳回至","reasons_field":"驳回理由"}],
+			"reject_to":"01"}`),
+		// 部署：入口要「结论 = 通过」。缺了 reject_on，02 的驳回就只会被这一段
+		// 当成「上游交得不对」退回来，两边对着卡到返工上限。
+		newStage(t, specsDir, `{"id":"03","name":"部署","produces":"卡三",
+			"entry":[{"from":"卡二","field":"结论","check":"equals","value":"通过"}],
+			"exit":[{"field":"D","check":"nonempty"}],"reject_to":"02"}`),
+	}, specsDir
+}
+
+// 审查者判了驳回，就该走回被点名的那一段——下游**一次都不该被叫醒**。
+//
+// 这是 验证B 实测出来的死锁：02 合法交付（结论=驳回），03 的入口要 结论=通过，
+// 于是 03 把 02 退回来、02 不改结论（证据没变，改了就是伪造）、两边来回，
+// 四个回合撞上返工上限，链路一个字节没往前挪。缺的是契约上那条往回走的边。
+func TestVerdictRoutesBackInsteadOfBouncingOffDownstream(t *testing.T) {
+	dir := t.TempDir()
+	stages, specsDir := verdictStages(t, dir)
+	evLog := filepath.Join(dir, "events.jsonl")
+	f := newFake(dir)
+
+	rejected := map[string]any{
+		"结论": "驳回", "驳回至": "01",
+		"驳回理由": []string{"一个超长 user_id 能永久打坏看板"},
+	}
+	r := &Runner{
+		Stages: stages, SpecsDir: specsDir, Dir: dir, Events: evLog,
+		Budget: 2, MaxRework: 3, Item: "看板",
+		Workers: map[string]dispatch.Worker{
+			"01": f.worker("卡一", map[string]any{"A": "v1"}, map[string]any{"A": "v2"}),
+			"02": f.worker("卡二", rejected, rejected, rejected),
+			"03": f.worker("卡三", map[string]any{"D": "ok"}),
+		},
+	}
+
+	// 01 每次都交同一份没人动的卡 → 02 每次都判驳回 → 该退到 01，来回直到上限。
+	err := r.Run(context.Background())
+	if !errors.Is(err, ErrNotConverging) {
+		t.Fatalf("该以「没收敛」收场，实际 %v", err)
+	}
+	if f.calls["卡三"] != 0 {
+		t.Errorf("02 判了驳回，03 一次都不该被叫醒，实际 %d 次", f.calls["卡三"])
+	}
+	if f.calls["卡一"] < 2 {
+		t.Errorf("该退回 01 让它补，实际只叫醒 %d 次", f.calls["卡一"])
+	}
+	// 退回时得把审查者的原话带下去，否则 01 只能拿着和上次一样的输入再交一遍。
+	if p := f.prompts["卡一"][1]; !strings.Contains(p, "永久打坏看板") {
+		t.Errorf("退回去的 prompt 要带审查者写的理由，实际:\n%s", p)
+	}
+
+	// 卡点落在被退回的那一段，且写着是审查判的——不是「某段入口判定没过」。
+	var sawVerdict bool
+	for _, e := range readEvents(t, evLog) {
+		s, _ := e["summary"].(string)
+		if e["type"] == "blocker" && e["stage"] == "开发" && strings.Contains(s, "审出") {
+			sawVerdict = true
+		}
+	}
+	if !sawVerdict {
+		t.Error("该留下一条「审查审出开发有问题」的卡点")
+	}
+}
+
+// 退回来的账要跟状态一起落盘：链路是会断的（停等人、撞南墙都要断），
+// 断了再续时那一段如果只知道自己叫 03，就会拿着和上次一样的输入再交一遍。
+func TestPendingReasonsSurviveARestart(t *testing.T) {
+	dir := t.TempDir()
+	stages, specsDir := verdictStages(t, dir)
+	evLog := filepath.Join(dir, "events.jsonl")
+	f := newFake(dir)
+
+	paused := map[string]any{
+		"A": "",
+		"待决策": []map[string]any{{
+			"问题": "超长 user_id 是拒绝还是截断",
+			"选项": []map[string]any{
+				{"选项": "写入端限长，超长拒收", "代价": "老客户端可能被打回"},
+				{"选项": "读取端跳过坏行", "代价": "静默丢一条登录"},
+			},
+		}},
+	}
+	rejected := map[string]any{
+		"结论": "驳回", "驳回至": "01",
+		"驳回理由": []string{"一个超长 user_id 能永久打坏看板"},
+	}
+	workers := func() map[string]dispatch.Worker {
+		return map[string]dispatch.Worker{
+			// 第一次交得出，被打回后第二次改口"这得需求方定"，拿到答复再交。
+			"01": f.worker("卡一", map[string]any{"A": "ok"}, paused, map[string]any{"A": "ok"}),
+			"02": f.worker("卡二", rejected),
+			"03": f.worker("卡三", map[string]any{"D": "ok"}),
+		}
+	}
+
+	// 第一趟：02 判驳回 → 退回 01 → 01 停下来等需求方。
+	err := (&Runner{
+		Stages: stages, SpecsDir: specsDir, Dir: dir, Events: evLog,
+		Budget: 1, MaxRework: 1, Item: "看板", Workers: workers(),
+	}).Run(context.Background())
+	if !errors.Is(err, dispatch.ErrAwaitingInput) {
+		t.Fatalf("该停在被退回的那一段等人，实际 %v", err)
+	}
+	st, _ := LoadState(dir)
+	if st.Stage != "01" || !st.Awaiting {
+		t.Fatalf("状态该记着在 01 等人，实际 stage=%q awaiting=%v", st.Stage, st.Awaiting)
+	}
+	if len(st.Back["01"]) == 0 {
+		t.Fatal("被退回的账没落盘——续跑那一段就看不见要补什么")
+	}
+
+	// 第二趟：换一个 Runner（等于进程重启），带着需求方的答复回来。
+	brief := filepath.Join(dir, "brief.json")
+	if err := os.WriteFile(brief, []byte(`{"口径":"超长拒收"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Runner{
+		Stages: stages, SpecsDir: specsDir, Dir: dir, Events: evLog,
+		Budget: 1, MaxRework: 1, Item: "看板", Brief: brief, Workers: workers(),
+	}).Run(context.Background()); !errors.Is(err, ErrNotConverging) {
+		t.Fatalf("02 还是交同一份驳回，该撞返工上限，实际 %v", err)
+	}
+
+	// 续跑那一次的 prompt 里，两样都得在：审查者写的那句，和需求方的答复。
+	p := f.prompts["卡一"][2]
+	if !strings.Contains(p, "永久打坏看板") {
+		t.Errorf("续跑丢了被退回的理由，那一段只能再交一遍同样的东西:\n%s", p)
+	}
+	if !strings.Contains(p, "超长拒收") {
+		t.Errorf("需求方的答复没进 prompt:\n%s", p)
+	}
+}
+
 func readEvents(t *testing.T, path string) []map[string]any {
 	t.Helper()
 	raw, err := os.ReadFile(path)

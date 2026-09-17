@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/TwitterIsGood/my-employee/internal/events"
 	"github.com/TwitterIsGood/my-employee/internal/pipeline"
@@ -56,6 +58,13 @@ var ErrBudgetExhausted = errors.New("重跑预算用尽，仍未达出口条件"
 // 本来就该等人回答的东西。
 var ErrAwaitingInput = errors.New("在等需求方的答复")
 
+// ErrWakeFailed 这一段的唤醒没能跑完：命令报错，或者超时被掐掉。
+//
+// 它和撞南墙分开：撞南墙是"跑了、判了、还是不收敛"，那是**判定**的结论，升级给人工指导者；
+// 这是**一次唤醒根本没跑成**，属于基础设施层面的中断。分开记，才不会让人去改一个
+// 本来没问题的交付物。
+var ErrWakeFailed = errors.New("阶段唤醒失败")
+
 // Worker 是一次唤醒的抽象。Agent 阶段与非 Agent 阶段（07 回归）只是命令不同，
 // 判定逻辑完全一样。
 type Worker interface {
@@ -70,6 +79,9 @@ type CmdWorker struct {
 	Log io.Writer
 }
 
+// waitDelay 是取消之后还肯等多久。过了就不等了——见下面对孙进程的说明。
+const waitDelay = 15 * time.Second
+
 func (w CmdWorker) Run(ctx context.Context, prompt string) error {
 	cmd := exec.CommandContext(ctx, "sh", "-c", w.Cmd)
 	cmd.Dir = w.Dir
@@ -79,6 +91,21 @@ func (w CmdWorker) Run(ctx context.Context, prompt string) error {
 	} else {
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	}
+
+	// 取消时要杀**一整组**，不能只 kill 掉 sh。唤醒里跑的命令会自己拉后台进程
+	// （起个服务、开个浏览器），只杀 sh 就等于每超时一次往机器上留一个孤儿，
+	// 端口和内存慢慢堆起来。
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// 上面那一刀只对 sh 这一组有效。万一还有别的进程攥着 stdout（Log 不是 *os.File
+	// 时 exec 会起一根管子来搬字节，孙进程握着它，Wait 就等不到 EOF），
+	// 这里就不等了。少了这一条，那个 kill 只是把一个死等换成另一个死等。
+	cmd.WaitDelay = waitDelay
 	return cmd.Run()
 }
 
@@ -101,7 +128,22 @@ type Runner struct {
 	// 少了它，上游会拿着和上次一模一样的输入再交一遍同样的东西——
 	// 驳回权就成了一道手续，而不是一次补交。
 	Reasons []string
-	Log     io.Writer
+	// WakeTimeout 一次唤醒的墙钟上限。它是「不会一直撞南墙」的机器形态：
+	// 一个挂住的唤醒比撞南墙更坏——撞南墙会升级给人，挂住是无声的、无限的。
+	// 留 0 表示用 defaultWakeTimeout。
+	WakeTimeout time.Duration
+	Log         io.Writer
+}
+
+// defaultWakeTimeout 给得宽：一次真实的 05 审查会自己跑脚本、复现反例，
+// 实测能到二十多分钟。这里卡的是"无限"，不是"慢"。
+const defaultWakeTimeout = 30 * time.Minute
+
+func (r Runner) wakeTimeout() time.Duration {
+	if r.WakeTimeout > 0 {
+		return r.WakeTimeout
+	}
+	return defaultWakeTimeout
 }
 
 // Run 跑一个阶段：先判入口（不够开工就打回上游），再唤醒，再判出口。
@@ -144,8 +186,21 @@ func (r Runner) Run(ctx context.Context, id string) error {
 	var last []pipeline.Violation
 	for attempt := 1; attempt <= r.Budget; attempt++ {
 		r.logf("—— 阶段 %s（%s）第 %d/%d 次唤醒 ——\n", st.ID, st.Name, attempt, r.Budget)
-		if err := r.Worker.Run(ctx, buildPrompt(st, spec, arts, out, r.Item, brief, r.Reasons, last)); err != nil {
-			return fmt.Errorf("阶段 %s 的唤醒失败: %w", st.ID, err)
+		wctx, cancel := context.WithTimeout(ctx, r.wakeTimeout())
+		err := r.Worker.Run(wctx, buildPrompt(st, spec, arts, out, r.Item, brief, r.Reasons, last))
+		expired := errors.Is(wctx.Err(), context.DeadlineExceeded)
+		cancel()
+		if err != nil {
+			// 唤醒失败要出声。原先这里只是 return，前台什么都看不到——
+			// 一段叫不醒，需求方那边就是"没动静"，而没动静和"在跑"长得一模一样。
+			if werr := r.wakeFailed(st, err, expired); werr != nil {
+				return werr
+			}
+			if expired {
+				return fmt.Errorf("%w：阶段 %s（%s）一次唤醒超过 %s，已终止",
+					ErrWakeFailed, st.ID, st.Name, r.wakeTimeout())
+			}
+			return fmt.Errorf("%w：阶段 %s 的唤醒失败: %v", ErrWakeFailed, st.ID, err)
 		}
 
 		a, err := r.readArtifact(st)
@@ -164,6 +219,23 @@ func (r Runner) Run(ctx context.Context, id string) error {
 		last = st.CheckExit(a)
 		if len(last) == 0 {
 			r.logf("阶段 %s 的交付通过出口条件：%s\n", st.ID, st.Produces)
+
+			// 出口过了，不等于这一趟就该往下走：交付里可能写着"上游有问题"——
+			// 05 的 `结论 = 驳回` 就是。往回走要在这里拦，不能出了出口就当成了。
+			v, hit, err := st.Route(a)
+			if err != nil {
+				return err
+			}
+			if hit {
+				rej := pipeline.RejectVerdict(r.Stages, st, v, r.Item)
+				if err := r.emit([]pipeline.Rejection{rej}); err != nil {
+					return err
+				}
+				return &UpstreamRejection{
+					Stage: st.ID, Targets: []string{v.Target},
+					Rejections: []pipeline.Rejection{rej},
+				}
+			}
 			return r.accept(st)
 		}
 
@@ -377,6 +449,29 @@ func (r Runner) escalate(st pipeline.Stage, vs []pipeline.Violation) error {
 		"on":        strings.Join(reasons, "；"),
 		"confirmed": true,
 		"evidence":  fmt.Sprintf("dispatch: 阶段 %s 出口判定 %d 次未过", st.ID, r.Budget),
+	})
+}
+
+// wakeFailed 把一次叫不醒的唤醒变成一条卡点。
+//
+// 为什么不只是往日志里写一句：叫不醒的那一段，前台那边看起来和"正在跑"一模一样，
+// 都是"没动静"。需求方向它提了需求，然后就是无尽的安静——这比任何一条驳回都难查。
+// 它在链路里也没有第二个信号源：不进事件日志，就没人会去管。
+//
+// 挂在哪一段由 st 决定，于是它按既有的消解规则走：这一段后来又交出了被接受的交付，
+// 这条卡点自己就撤了。
+func (r Runner) wakeFailed(st pipeline.Stage, err error, expired bool) error {
+	why := err.Error()
+	if expired {
+		why = fmt.Sprintf("一次唤醒超过 %s 没有返回，已连同它拉起的子进程一起终止", r.wakeTimeout())
+	}
+	return r.write(map[string]any{
+		"type":      "blocker",
+		"stage":     st.Name,
+		"summary":   fmt.Sprintf("阶段 %s（%s）叫不醒，链路停在原地", st.ID, st.Name),
+		"on":        why,
+		"confirmed": true,
+		"evidence":  fmt.Sprintf("dispatch: 阶段 %s 唤醒失败", st.ID),
 	})
 }
 

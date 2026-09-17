@@ -44,7 +44,11 @@ type State struct {
 	Done     bool     `json:"done"`
 	Awaiting bool     `json:"awaiting"`
 	Note     string   `json:"note,omitempty"`
-	Updated  string   `json:"updated"`
+	// Back 是"被退回来的那一段欠着谁哪几条"。它得跟状态一起落盘——
+	// 链路是会断的（等人、撞南墙都要断），断了再续时那一段如果只知道自己叫 03，
+	// 就会拿着和上次一模一样的输入再交一遍：驳回权成了一道手续。
+	Back    map[string][]string `json:"back,omitempty"`
+	Updated string              `json:"updated"`
 }
 
 func LoadState(dir string) (State, error) {
@@ -86,11 +90,14 @@ type Runner struct {
 	Item    string
 	Brief   string
 	Restart bool // 丢掉旧状态，从头走
-	Log     io.Writer
+	// WakeTimeout 一次唤醒的墙钟上限，交给 dispatch 管。整条链看得见"撞南墙"，
+	// 但看不见"叫不醒"——一个不返回的唤醒在这里是一动不动的，连南墙都到不了。
+	WakeTimeout time.Duration
+	Log         io.Writer
 
-	// back 记着"哪一段被点名要补什么"。它只在一次 Run 之内有效：被退回来的那段
-	// 立刻就会重跑，而重跑时它得看得见下游点名的条——否则它会把同一份东西再交一遍，
-	// 驳回权就成了一道手续。
+	// back 记着"哪一段被点名要补什么"。被退回来的那段立刻就会重跑，重跑时它得看得见
+	// 下游点名的条——否则它会把同一份东西再交一遍，驳回权就成了一道手续。
+	// 它是 State.Back 在这次 Run 里的镜像，随状态落盘，断点续跑接得上。
 	back map[string][]string
 }
 
@@ -120,6 +127,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.Item != "" {
 		st.Item = r.Item
 	}
+	// 上一趟断在这儿时欠的账，这一趟接着还。
+	r.back = st.Back
 	if err := SaveState(r.Dir, st); err != nil {
 		return err
 	}
@@ -162,6 +171,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			if !contains(st.Passed, st.Stage) {
 				st.Passed = append(st.Passed, st.Stage)
 			}
+			// 这一段已经把点名的条读进 prompt 了，账销掉。留着它，下一趟断点续跑
+			// 会拿两轮以前的原因去叫醒它——那比没有原因更坏，它会把没人要的东西补一遍。
+			delete(st.Back, st.Stage)
 			st.Awaiting, st.Note = false, ""
 			if idx+1 >= len(r.Stages) {
 				st.Done = true
@@ -196,7 +208,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			if berr != nil {
 				return berr
 			}
-			r.remember(ur)
+			r.remember(&st, ur)
 			st.Stage, st.Note = back, err.Error()
 			if serr := SaveState(r.Dir, st); serr != nil {
 				return serr
@@ -226,7 +238,7 @@ func (r *Runner) stageRunner(id string) dispatch.Runner {
 	return dispatch.Runner{
 		Stages: r.Stages, SpecsDir: r.SpecsDir, Dir: r.Dir, Events: r.Events,
 		Budget: r.Budget, Worker: w, Item: r.Item, Brief: r.Brief, Log: r.Log,
-		Reasons: r.back[id],
+		WakeTimeout: r.WakeTimeout, Reasons: r.back[id],
 	}
 }
 
@@ -234,11 +246,12 @@ func (r *Runner) stageRunner(id string) dispatch.Runner {
 //
 // 上一轮的账全部作废：这一次驳回说的是另一件事，留着旧的会让被退回来的那段
 // 去补一批已经没人要的东西。
-func (r *Runner) remember(ur *dispatch.UpstreamRejection) {
+func (r *Runner) remember(st *State, ur *dispatch.UpstreamRejection) {
 	r.back = map[string][]string{}
 	for _, rej := range ur.Rejections {
 		r.back[rej.From] = append(r.back[rej.From], rej.Reasons...)
 	}
+	st.Back = r.back
 }
 
 // earliest 取回退点里最靠前的那一段。

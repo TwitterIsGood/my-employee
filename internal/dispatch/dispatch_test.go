@@ -6,8 +6,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/TwitterIsGood/my-employee/internal/events"
 	"github.com/TwitterIsGood/my-employee/internal/pipeline"
@@ -173,6 +176,197 @@ func TestVagueUpstreamRejectsAndPointsAtProducer(t *testing.T) {
 	if evs[0]["stage"] != "需求澄清" {
 		t.Errorf("该打回「需求澄清」，实际 %v", evs[0]["stage"])
 	}
+}
+
+// 出口过了 ≠ 这一趟就该往下走：05 判「驳回」是在**裁决**上游，不是自己没交够。
+//
+// 这条边曾经是缺的，代价是实测出来的：05 合法交付（结论=驳回），06 的入口要
+// 结论=通过，于是 06 把它退回来、05 不改结论、两边对着卡死到返工上限。
+// 两边都守着自己的契约，链路一个字节没往前挪——缺的是契约，不是哪一段失职。
+func TestVerdictBouncesUpstreamInsteadOfAdvancing(t *testing.T) {
+	dir := t.TempDir()
+	eventsLog := filepath.Join(dir, "events.jsonl")
+
+	// 05 的入口：04 得交出一份带退出码和未覆盖清单的测试报告。
+	write(t, dir, "测试报告", map[string]any{
+		"退出码": 0, "用例数": 6,
+		"未覆盖场景": []string{"超长 user_id"},
+	})
+
+	calls, w := writer(dir, "审查记录", map[string]any{
+		"结论":   "驳回",
+		"驳回至":  "03",
+		"驳回理由": []string{"一个 ~1MB 的 user_id 能让看板永久 500"},
+		"证伪尝试": []map[string]any{
+			{"怎么试的": "POST /login 带一个超长 user_id", "结果": "缓存写坏，之后每次请求都 500"},
+		},
+		"反例": "POST /login 带超长 user_id 返回 200；随后 GET /api/daily 一直 500",
+	})
+
+	err := Runner{
+		Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+		Events: eventsLog, Budget: 3, Item: "活跃度看板", Worker: w,
+	}.Run(context.Background(), "05")
+
+	var ur *UpstreamRejection
+	if !errors.As(err, &ur) {
+		t.Fatalf("05 判了驳回，就该把上游打回，而不是过关交给 06：%v", err)
+	}
+	if len(ur.Targets) != 1 || ur.Targets[0] != "03" {
+		t.Errorf("退回目标该由交付物里的「驳回至」点名（03），实际 %v", ur.Targets)
+	}
+	if *calls != 1 {
+		t.Errorf("裁决一判出来就该往回走，不该再唤醒 05，实际 %d 次", *calls)
+	}
+
+	evs := blockers(t, eventsLog)
+	if len(evs) != 1 {
+		t.Fatalf("应留下一条 blocker，实际 %v", evs)
+	}
+	// 卡点落在**被退回**的那一段（03 本地开发），不是审查者自己那一段——
+	// 前台说"卡在本地开发"才是让人知道该谁去改。
+	if evs[0]["stage"] != "本地开发" {
+		t.Errorf("卡点该写被退回的「本地开发」，实际 %v", evs[0]["stage"])
+	}
+	if !strings.Contains(str(evs[0]["on"]), "永久 500") {
+		t.Errorf("退回理由要带审查者的原话，不能只剩字段名，实际 %v", evs[0]["on"])
+	}
+	if !strings.Contains(str(evs[0]["summary"]), "对抗式审查") {
+		t.Errorf("一句里该点明是谁审出来的，实际 %v", evs[0]["summary"])
+	}
+}
+
+// 结论是「通过」时这段裁决不许误伤：05 照常交给下游，一条 blocker 都不该有。
+func TestVerdictPassAdvancesNormally(t *testing.T) {
+	dir := t.TempDir()
+	eventsLog := filepath.Join(dir, "events.jsonl")
+	write(t, dir, "测试报告", map[string]any{
+		"退出码": 0, "未覆盖场景": []string{"超长 user_id"},
+	})
+
+	calls, w := writer(dir, "审查记录", map[string]any{
+		"结论":    "通过",
+		"证伪尝试":  []map[string]any{{"怎么试的": "并发登录同一用户", "结果": "计数无不一致"}},
+		"未覆盖范围": []string{"超长 user_id"},
+	})
+
+	err := Runner{
+		Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+		Events: eventsLog, Budget: 2, Item: "活跃度看板", Worker: w,
+	}.Run(context.Background(), "05")
+	if err != nil {
+		t.Fatalf("结论通过就该过关: %v", err)
+	}
+	if *calls != 1 {
+		t.Errorf("该只唤醒 1 次，实际 %d 次", *calls)
+	}
+	if evs := blockers(t, eventsLog); len(evs) != 0 {
+		t.Errorf("通过了就不该留卡点，实际 %v", evs)
+	}
+}
+
+// 判了驳回却没写退给谁——不能猜、不能默认退到 reject_to，只能报错。
+// 猜错的代价是通知错人去改，而错的那段会拿着一张没问题的卡再来一遍。
+func TestVerdictWithoutTargetIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "测试报告", map[string]any{
+		"退出码": 0, "未覆盖场景": []string{"超长 user_id"},
+	})
+	// 出口条件本身是过得去的：结论合法、证伪尝试有、驳回附了反例。
+	calls, w := writer(dir, "审查记录", map[string]any{
+		"结论":   "驳回",
+		"驳回理由": []string{"有问题"},
+		"证伪尝试": []map[string]any{{"怎么试的": "试了", "结果": "坏了"}},
+		"反例":   "复现路径",
+	})
+
+	err := Runner{
+		Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+		Budget: 1, Item: "活跃度看板", Worker: w,
+	}.Run(context.Background(), "05")
+	if err == nil || !strings.Contains(err.Error(), "驳回至") {
+		t.Fatalf("该报「没说退给谁」并点名缺失字段，实际 %v", err)
+	}
+	if *calls != 1 {
+		t.Errorf("这是判定炸了，不是重跑的事，实际唤醒 %d 次", *calls)
+	}
+}
+
+// 挂住的唤醒要有个头，而且得出声。
+//
+// 实测过一次：05 的自写探针脚本拉起一个 headless 浏览器，浏览器卡住不返回，
+// 整条链路就停在那儿——既没往下走，也没走到"撞南墙该升级"的那一刻。
+// 它比撞南墙更坏：撞南墙会升级给人，挂住是无声的、无限的。
+func TestAHangingWakeIsBoundedAndVisible(t *testing.T) {
+	dir := t.TempDir()
+	eventsLog := filepath.Join(dir, "events.jsonl")
+
+	hung := WorkerFunc(func(ctx context.Context, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	start := time.Now()
+	err := Runner{
+		Stages: loadStages(t), SpecsDir: specsDir(), Dir: dir,
+		Events: eventsLog, Budget: 3, Item: "看板", Worker: hung,
+		WakeTimeout: 200 * time.Millisecond,
+	}.Run(context.Background(), "01")
+
+	if !errors.Is(err, ErrWakeFailed) {
+		t.Fatalf("挂住的唤醒该报唤醒失败，实际 %v", err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("挂了 %s 才回来——上限没起作用", d)
+	}
+
+	// 前台那边"叫不醒"和"正在跑"长得一模一样，都是没动静。所以得留一条卡点。
+	evs := blockers(t, eventsLog)
+	if len(evs) != 1 {
+		t.Fatalf("该留下一条卡点，实际 %v", evs)
+	}
+	if !strings.Contains(str(evs[0]["on"]), "没有返回") {
+		t.Errorf("卡点要说清是超时，而不是含糊的一句失败，实际 %v", evs[0]["on"])
+	}
+}
+
+// 一个不返回的唤醒要在上限上被掐掉，而且掐的时候要连它拉起的后台进程一起收走。
+//
+// 实测的那一次就是这样：05 的探针脚本在前台等着一个卡住的 headless 浏览器，
+// 脚本不返回；而脚本此前起过的服务还开着端口。只杀 sh 的话，那些服务会留下来。
+func TestATimedOutWakeIsKilledWithItsChildren(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	// 先起一个后台进程记下自己的 pid，再在前台挂住——挂的是前台那条。
+	cmd := "sleep 300 & echo $! > " + pidFile + "; sleep 300"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	if err := (CmdWorker{Cmd: cmd, Dir: dir}).Run(ctx, ""); err == nil {
+		t.Fatal("超时了就该报错，不能装作跑完了")
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("上限没起作用，%s 才回来", d)
+	}
+
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pid, 0) != nil {
+			return // 收走了
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("超时收走了 sh，却把子进程 %d 留在了机器上", pid)
 }
 
 // 交付物没写出来 / 不是合法 JSON，也走同一条打回重跑的路，不能变成旁路。
@@ -471,6 +665,19 @@ func readEvents(t *testing.T, path string) []map[string]any {
 			t.Fatalf("事件日志不是合法 JSONL: %v", err)
 		}
 		out = append(out, ev)
+	}
+	return out
+}
+
+// blockers 只挑卡点。日志里还混着 progress 那种"走到哪一段了"的脚印，
+// 它们前台看不到，混在一起数就把门槛验糊了。
+func blockers(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, e := range readEvents(t, path) {
+		if e["type"] == "blocker" {
+			out = append(out, e)
+		}
 	}
 	return out
 }

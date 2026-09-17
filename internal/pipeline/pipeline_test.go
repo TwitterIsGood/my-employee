@@ -454,3 +454,133 @@ func TestUnknownCheckFailsLoudly(t *testing.T) {
 		t.Fatalf("未知判定词应报错，实际: %v", vs)
 	}
 }
+
+// —— 裁决要有去向 ——
+//
+// 这一段是拿一趟真实的七段链路换来的：05 审出一条可复现的回归，结论照实写 `驳回`、
+// `驳回至` 写 `03`。它合法地过了自己的出口，被交给 06；06 的入口要 `结论 = 通过`，
+// 于是把 05 退回来。两边都没错，链路一个字节没往前挪，四个来回之后撞上限。
+//
+// 契约缺的就是这条边：判出来的 `驳回` 没有去向。
+
+func verdictStage(t *testing.T, contract string) Stage {
+	t.Helper()
+	dir := t.TempDir()
+	writeStage(t, dir, "01-a.md", contract)
+	stages, err := Load(dir)
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	return stages[0]
+}
+
+func TestVerdictRoutesBackToTheStageItNames(t *testing.T) {
+	s := verdictStage(t, `{"id":"01","name":"A","produces":"甲",
+		"exit":[{"field":"结论","check":"one_of","value":["通过","驳回"]}],
+		"reject_on":[{"when":[{"field":"结论","check":"equals","value":"驳回"}],
+		              "target_field":"驳回至","reasons_field":"驳回理由"}]
+		}`)
+
+	v, hit, err := s.Route(art(t, `{"结论":"驳回","驳回至":"03","驳回理由":"一个超长 user_id 能永久打坏看板"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hit {
+		t.Fatal("结论是驳回，该判出退回上游")
+	}
+	if v.Target != "03" {
+		t.Errorf("退回目标该是 03，实际 %q", v.Target)
+	}
+	if len(v.Reasons) != 1 || !strings.Contains(v.Reasons[0], "永久打坏看板") {
+		t.Errorf("理由该带审查者写的那句人话，实际 %v", v.Reasons)
+	}
+}
+
+// 通过就是往下走，别把正常交付误拦。
+func TestVerdictDoesNotFireOnPass(t *testing.T) {
+	s := verdictStage(t, `{"id":"01","name":"A","produces":"甲",
+		"exit":[{"field":"结论","check":"one_of","value":["通过","驳回"]}],
+		"reject_on":[{"when":[{"field":"结论","check":"equals","value":"驳回"}],
+		              "target_field":"驳回至","reasons_field":"驳回理由"}]}`)
+
+	if _, hit, err := s.Route(art(t, `{"结论":"通过"}`)); err != nil || hit {
+		t.Fatalf("通过不该触发退回: hit=%v err=%v", hit, err)
+	}
+}
+
+// 判出该退回、却说不清退给谁 —— 报错，不是放行。
+// 静默放行的结果就是原来那条死循环：05 把驳回交给 06，06 再退回来。
+func TestVerdictWithoutTargetIsAnError(t *testing.T) {
+	s := verdictStage(t, `{"id":"01","name":"A","produces":"甲",
+		"exit":[{"field":"结论","check":"one_of","value":["通过","驳回"]}],
+		"reject_on":[{"when":[{"field":"结论","check":"equals","value":"驳回"}],
+		              "target_field":"驳回至","reasons_field":"驳回理由"}]}`)
+
+	if _, _, err := s.Route(art(t, `{"结论":"驳回"}`)); err == nil {
+		t.Error("判出要退回却不写退回给谁，必须报错")
+	}
+}
+
+// 前置字段缺失时判不了，就得报错——不能当成"没命中"悄悄放过去。
+func TestVerdictWithMissingPreconditionIsAnError(t *testing.T) {
+	s := verdictStage(t, `{"id":"01","name":"A","produces":"甲",
+		"exit":[{"field":"证伪尝试","check":"min_items","value":1}],
+		"reject_on":[{"when":[{"field":"结论","check":"equals","value":"驳回"}],
+		              "target_field":"驳回至"}]}`)
+
+	if _, _, err := s.Route(art(t, `{"证伪尝试":["x"]}`)); err == nil {
+		t.Error("前置的 结论 缺失，该报错而不是当成没命中")
+	}
+}
+
+// 没写理由也要能给前台一句话：空着的卡点等于没说。
+func TestVerdictWithoutReasonsStillSaysSomething(t *testing.T) {
+	s := verdictStage(t, `{"id":"01","name":"A","produces":"甲",
+		"exit":[{"field":"结论","check":"one_of","value":["通过","驳回"]}],
+		"reject_on":[{"when":[{"field":"结论","check":"equals","value":"驳回"}],
+		              "target_field":"驳回至","reasons_field":"驳回理由"}]}`)
+
+	v, hit, err := s.Route(art(t, `{"结论":"驳回","驳回至":"03"}`))
+	if err != nil || !hit {
+		t.Fatalf("hit=%v err=%v", hit, err)
+	}
+	if len(v.Reasons) == 0 || strings.TrimSpace(v.Reasons[0]) == "" {
+		t.Error("理由为空，前台会读到一条什么都说不出的卡点")
+	}
+}
+
+// 真实契约里 05 必须挂着这条边——它正是那个死循环的成因。
+func TestRealReviewStageRoutesItsVerdict(t *testing.T) {
+	s, ok := ByID(loadReal(t), "05")
+	if !ok {
+		t.Fatal("没有阶段 05")
+	}
+	v, hit, err := s.Route(art(t, `{"结论":"驳回","驳回至":"03","驳回理由":"可复现的反例"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hit || v.Target != "03" {
+		t.Fatalf("05 判出驳回必须能退回 03，实际 hit=%v target=%q", hit, v.Target)
+	}
+}
+
+// 判回上游的那条事件，措辞不能写成"06 的入口判定"——06 根本没参与这件事。
+func TestVerdictRejectionSaysItCameFromTheReview(t *testing.T) {
+	stages := loadReal(t)
+	s, _ := ByID(stages, "05")
+	rej := RejectVerdict(stages, s, Verdict{Target: "03", Reasons: []string{"一个超长 user_id 能永久打坏看板"}}, "活跃度看板")
+
+	ev := rej.Event()
+	if ev["stage"] != "本地开发" {
+		t.Errorf("卡点该挂在被打回的那一段上，实际 %v", ev["stage"])
+	}
+	if !strings.Contains(fmt.Sprint(ev["evidence"]), "裁决") {
+		t.Errorf("证据行该说这是审查者的裁决，实际 %v", ev["evidence"])
+	}
+	if !strings.Contains(fmt.Sprint(ev["summary"]), "对抗式审查") {
+		t.Errorf("summary 该说清是谁审出来的，实际 %v", ev["summary"])
+	}
+	if !strings.Contains(fmt.Sprint(ev["on"]), "永久打坏看板") {
+		t.Errorf("前台该读到审查者写的理由，实际 %v", ev["on"])
+	}
+}
